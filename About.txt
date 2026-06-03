@@ -1,0 +1,35 @@
+What my group gonna do: Authentication Log Anomaly Detection for Brute Force / Account Abuse
+
+Scope ?
+Anomaly detection (unsupervised) : Look for deviations from normal behavior
+( ai is trained to realize normal behavior and recognize these, if not, alert)
+or 
+
+binary classification supervised : Look for known pattern
+( ai is trained to recognize both normal and attack pattern, and classify these twos)
+
+
+Recommended dataset
+HDFS Log Dataset (practice); generated SSH or Windows auth logs; custom auth logs	
+
+Requirements
+Design a security data pipeline: parse logs, create time-window features such as failed_logins_5m_per_user and unique_src_ip_1h, and compare an unsupervised approach with a supervised baseline if labels are available.	
+Recommended models
+Isolation Forest / One-Class SVM / Logistic Regression / XGBoost / LSTM (optional)	
+
+Metrics
+Precision, Recall, F1, alert volume, false positives per day
+
+
+
+Notice: 
+Because requirement is also about multiple logs inspection !
+
+We need an model can work almost like AI-powered siem system
+---
+Need to parse data according to time-window, user, ... into a single big snapshot for ai to analyze
+
+Structure: 
+[ Raw Auth Logs ] ➔ [ Data Parser & Feature Engineer ] ➔ [ AI Model Detection ] ➔ [ Alert Dashboard ]
+
+
