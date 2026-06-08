@@ -45,3 +45,16 @@ Option 2: The "Multi-Stage Pipeline" Approach (Models Working Together)If you wa
 Model 1 (The Brute-Force Detector): A supervised model (like XGBoost or Random Forest) trained specifically to look at high-frequency failures. It is highly accurate at catching noisy, aggressive attacks.
 
 Model 2 (The Account Abuse Detector): An unsupervised model (like Isolation Forest) that looks at user profiles. It triggers if a user suddenly logs in at 4 AM from a different country, even if they get the password right on the first try (stolen credentials).
+
+Phuc
+
+3.3  Cybersecurity problem to be addressed:
+va 
+3.12 Key risks and mitigation plan:
+
+
+3.8 plan for main model
+
+ML Engineer - Improved Model: Phát triển mô hình nâng cao như XGBoost/LightGBM/LSTM.  
+
+Phat trien mo hinh, lay dataset, luu model dc train va ap dung
