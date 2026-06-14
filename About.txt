@@ -58,3 +58,55 @@ va
 ML Engineer - Improved Model: Phát triển mô hình nâng cao như XGBoost/LightGBM/LSTM.  
 
 Phat trien mo hinh, lay dataset, luu model dc train va ap dung
+
+#################
+Goal:
+
+Apply the pipeline to brute force detection ( and account abuse if possible) using XGBoost as the main model, and compare it with an unsupervised approach like Isolation Forest.
+
+For supervised learning, we will train an XGBoost model to distinguish between normal login attempts and brute force attacks.
+We will use features such as the number of failed login attempts in the last 5 minutes, the number of unique source IPs in the last hour, and other relevant features extracted from the authentication logs.
+
+
+Data:
+
+Windows Event 4624/4625
+SSH auth logs
+Generated login attempts
+
+Features: ( no user features, only time and frequency features )
+(in xgboost file)
+
+Model:
+
+XGBoost
+
+Output:
+
+Normal
+Brute Force
+Account Abuse
+
+
+For unsupervised learning, we will use (Isolation Forest or else) to identify anomalies in the login patterns. 
+This model will be trained on normal login data and will flag any deviations from this pattern as potential anomalies, which could indicate brute force attacks or account abuse.
+
+Data:
+Windows Event 4624/4625
+SSH auth logs
+Los alamos dataset
+cert insider threat dataset
+Features: ( no user features, only time and frequency features )
+
+Time features: hour of the day, day of the week, weekend vs weekday
+Frequency features: number of login attempts in the last 5 minutes, number of unique source IPs in the last hour
+Failure features: number of failed login attempts, ratio of failed to successful logins
+Ratio features: ratio of login attempts from new IPs vs known IPs, ratio of login attempts from new devices vs known devices
+Aggregate features: total number of login attempts in the last day, total number of unique source IPs in the last week, unique user-agent strings used in the last month
+
+Model:
+Isolation Forest
+
+Output:
+Normal
+Anomaly (potential brute force or account abuse)
