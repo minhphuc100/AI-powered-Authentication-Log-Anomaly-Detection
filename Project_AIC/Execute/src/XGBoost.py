@@ -5,13 +5,9 @@ import pandas as pd, inspect
 # supervised learning, classification, binary classification, imbalanced dataset
 #we will use XGBoost, a powerful boosting algorithm based on decision trees, to improve accuracy and reduce overfitting compared to a single decision tree. XGBoost works by building a series of smaller decision trees that focus on correcting the errors of the previous trees, and then combines them to create a stronger model.
 df = pd.read_csv('../dataset/data.csv')
+
+
 """
-
-
-
-
-
-
 
 Windows Event Viewer (4624, 4625) the exact same features as the previous dataset, but with a different focus on logon events. The features include:
 
@@ -75,7 +71,7 @@ However, it may require some preprocessing to extract the relevant features for 
 
 So we going to do both:
 
-1. Testing the xgboost on the HDFS dataset, which is not an authentication dataset but can still be used for testing the model's performance on a different type of data.
+#1. Testing the xgboost on the HDFS dataset, which is not an authentication dataset but can still be used for testing the model's performance on a different type of data.
 
 2. Using the Los Alamos Authentication Dataset or another relevant dataset to train and evaluate the XGBoost model for binary classification of normal vs attack logon events, and to engineer the necessary features from the raw log data.
 
