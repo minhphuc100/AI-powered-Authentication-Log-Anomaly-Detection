@@ -73,7 +73,23 @@ Can you evaluate Precision, Recall, F1?
 HDFS is not an authentication dataset ! Because of that, we will use the Los Alamos Authentication Dataset, which contains enterprise authentication data at a massive scale and is frequently used in research. 
 However, it may require some preprocessing to extract the relevant features for our classification task.
 
+So we going to do both:
 
+1. Testing the xgboost on the HDFS dataset, which is not an authentication dataset but can still be used for testing the model's performance on a different type of data.
 
+2. Using the Los Alamos Authentication Dataset or another relevant dataset to train and evaluate the XGBoost model for binary classification of normal vs attack logon events, and to engineer the necessary features from the raw log data.
 
 """
+
+
+
+
+
+
+
+
+
+
+
+
+
