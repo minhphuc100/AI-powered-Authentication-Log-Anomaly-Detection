@@ -1,84 +1,113 @@
+# src/data_engineering/parser.py
+
 import pandas as pd
-import re
-import os
+import numpy as np
+from pathlib import Path
 
-def extract_field_from_message(message, pattern):
-    """
-    Hàm phụ trợ để trích xuất dữ liệu từ chuỗi văn bản Message bằng Regex.
-    """
-    if pd.isna(message):
-        return None
-    match = re.search(pattern, str(message))
-    if match:
-        return match.group(1).strip()
-    return None
+RAW_PATH       = Path("data/raw/auth_logs_raw.csv")
+PROCESSED_PATH = Path("data/processed/parsed_auth_logs.csv")
 
-def parse_windows_auth_logs(input_filepath, output_filepath):
-    """
-    Hàm chính để đọc file log thô, bóc tách đặc trưng và lưu ra file dữ liệu sạch.
-    """
-    print(f"Đang đọc dữ liệu thô từ: {input_filepath}")
-    
-    try:
-        # Đọc file CSV, thường log của Windows xuất ra sẽ có cột 'Id', 'TimeCreated', 'Message'
-        df = pd.read_csv(input_filepath, encoding='utf-8')
-    except Exception as e:
-        print(f"Lỗi khi đọc file: {e}")
-        return None
+EVENT_MAP = {
+    4624: "logon_success",
+    4625: "logon_failure",
+    4648: "explicit_logon",
+    4634: "logoff"
+}
 
-    # Kiểm tra xem các cột cần thiết có tồn tại không
-    required_columns = ['Id', 'TimeCreated', 'Message']
-    for col in required_columns:
-        if col not in df.columns:
-            print(f"Lỗi: Không tìm thấy cột '{col}' trong dữ liệu gốc.")
-            return None
+LOGON_TYPE_MAP = {
+    "2":  "interactive",
+    "3":  "network",
+    "4":  "batch",
+    "5":  "service",
+    "7":  "unlock",
+    "8":  "network_cleartext",
+    "10": "remote_interactive",
+    "11": "cached_interactive"
+}
 
-    print(f"Số lượng log ban đầu: {len(df)} dòng. Bắt đầu phân tích cú pháp...")
+SYSTEM_ACCOUNTS = {"SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "-", ""}
 
-    # 1. Trích xuất Tên tài khoản (Account Name)
-    # Lấy Account Name thứ 2 (thường thuộc phần New Logon hoặc Target Account) để tránh lấy tên SYSTEM của máy
-    df['AccountName'] = df['Message'].apply(
-        lambda x: extract_field_from_message(x, r"Account Name:\s+(.*?)(?:\r|\n|$)")
+
+def load_raw(path: Path = RAW_PATH) -> pd.DataFrame:
+    df = pd.read_csv(path)
+
+    # FIX 1: Chỉ định rõ format timestamp → không còn warning
+    df["TimeCreated"] = pd.to_datetime(
+        df["TimeCreated"],
+        format="%m/%d/%Y %I:%M:%S %p",
+        errors="coerce"
     )
 
-    # 2. Trích xuất Loại đăng nhập (Logon Type)
-    df['LogonType'] = df['Message'].apply(
-        lambda x: extract_field_from_message(x, r"Logon Type:\s+(\d+)")
-    )
+    # FIX 2: Drop Status/SubStatus ngay từ đầu vì ~97% null, không dùng được
+    df = df.drop(columns=["Status", "SubStatus"], errors="ignore")
 
-    # 3. Trích xuất Địa chỉ IP nguồn (Source Network Address / Source IP)
-    # Rất quan trọng cho việc đếm unique_src_ip_1h sau này
-    df['SourceIP'] = df['Message'].apply(
-        lambda x: extract_field_from_message(x, r"Source Network Address:\s+([^\r\n]+)")
-    )
-    # Lọc bỏ các IP rỗng hoặc giá trị '-'
-    df['SourceIP'] = df['SourceIP'].replace('-', 'Unknown')
+    # FIX 3: Fix IP "-" thành NaN ngay lúc load (trước khi rename cột)
+    df["IpAddress"] = df["IpAddress"].replace({"-": np.nan, "::1": np.nan})
 
-    # 4. Gán nhãn (Labeling) trực tiếp dựa trên Event ID
-    # Event ID 4624 = Đăng nhập thành công (Normal)
-    # Event ID 4625 = Đăng nhập thất bại (Anomaly/Brute Force)
-    df['Label'] = df['Id'].apply(lambda x: 'Anomaly' if str(x) == '4625' else 'Normal')
+    print(f"[parser] Loaded {len(df):,} rows from {path}")
+    return df
 
-    # 5. Chuyển đổi định dạng thời gian cho chuẩn xác
-    df['TimeCreated'] = pd.to_datetime(df['TimeCreated'], errors='coerce')
 
-    # 6. Lọc lại các cột cần thiết để làm dữ liệu sạch
-    clean_df = df[['TimeCreated', 'Id', 'AccountName', 'LogonType', 'SourceIP', 'Label']]
-    
-    # Sắp xếp lại log theo đúng trình tự thời gian
-    clean_df = clean_df.sort_values(by='TimeCreated').reset_index(drop=True)
+def clean(df: pd.DataFrame) -> pd.DataFrame:
+    # Chuẩn hóa tên cột
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Lưu ra file CSV mới
-    os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
-    clean_df.to_csv(output_filepath, index=False, encoding='utf-8')
-    
-    print(f"Hoàn thành! Đã lưu {len(clean_df)} dòng dữ liệu sạch tại: {output_filepath}")
-    return clean_df
+    df = df.rename(columns={
+        "timecreated": "timestamp",
+        "eventid":     "event_id",
+        "username":    "username",
+        "ipaddress":   "src_ip",
+        "logontype":   "logon_type",
+        "workstation": "workstation",
+    })
+
+    # Drop timestamp không hợp lệ
+    df = df.dropna(subset=["timestamp"])
+
+    # FIX 4: Deduplicate — inject_bruteforce chạy 2 lần gây ra 909 dòng trùng
+    before = len(df)
+    df = df.drop_duplicates()
+    after = len(df)
+    if before != after:
+        print(f"[parser] Removed {before - after:,} duplicate rows")
+
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    # Map event_id → tên rõ nghĩa
+    df["event_type"] = df["event_id"].map(EVENT_MAP).fillna("unknown")
+
+    # Map logon_type → tên rõ nghĩa
+    df["logon_type_name"] = df["logon_type"].astype(str).map(LOGON_TYPE_MAP).fillna("unknown")
+
+    # Làm sạch username — system accounts không cần detect anomaly
+    df["username"] = df["username"].str.strip()
+    df.loc[df["username"].isin(SYSTEM_ACCOUNTS), "username"] = np.nan
+
+    # Làm sạch workstation
+    df["workstation"] = df["workstation"].replace({"-": np.nan})
+
+    # KHÔNG gắn label ở đây — label phụ thuộc vào time-window features
+    # nên để feature_builder.py xử lý sau
+
+    print(f"[parser] After cleaning: {len(df):,} rows")
+    print(f"[parser] Event distribution:")
+    print(df["event_type"].value_counts().to_string())
+    print(f"[parser] IP coverage: {df['src_ip'].notna().sum():,} / {len(df):,} rows có IP")
+    return df
+
+
+def save(df: pd.DataFrame, path: Path = PROCESSED_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    print(f"[parser] Saved {len(df):,} rows → {path}")
+
+
+def run() -> pd.DataFrame:
+    df = load_raw()
+    df = clean(df)
+    save(df)
+    return df
+
 
 if __name__ == "__main__":
-    # Đường dẫn file theo đúng cấu trúc thư mục của nhóm bạn
-    INPUT_FILE = r"data\raw\windows_auth_logs.csv"
-    OUTPUT_FILE = r"data\processed\parsed_auth_logs.csv"
-    
-    # Chạy pipeline
-    parse_windows_auth_logs(INPUT_FILE, OUTPUT_FILE)
+    run()
