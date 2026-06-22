@@ -1,13 +1,3 @@
-# data/raw/generate_synthetic_logs.py
-#
-# Sinh dataset Windows Authentication Log HOÀN TOÀN MỚI (không dựa vào log thật)
-# Mô phỏng 1 tổ chức nhỏ trong 30 ngày với:
-#   - Nhiều user (nhân viên) hoạt động bình thường
-#   - Nhiều kịch bản tấn công khác nhau, rải đều theo thời gian
-#   - Tách rõ thời gian để tránh data leakage khi chia train/test
-#
-# Chạy: python data/raw/generate_synthetic_logs.py
-
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -204,6 +194,3 @@ print(df["EventID"].value_counts().to_string())
 print(f"\nUnique users: {df['UserName'].nunique()}")
 print(f"Unique IPs: {df['IpAddress'].nunique()}")
 print(f"\nSaved to: {OUTPUT_PATH}")
-print(f"\nGợi ý chia train/test: dùng 22 ngày đầu cho train, 8 ngày cuối cho test")
-print(f"  Train: {START_DATE.date()} -> {(START_DATE + timedelta(days=21)).date()}")
-print(f"  Test:  {(START_DATE + timedelta(days=22)).date()} -> {(START_DATE + timedelta(days=N_DAYS-1)).date()}")
