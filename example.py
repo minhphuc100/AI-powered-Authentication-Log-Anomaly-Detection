@@ -1,3 +1,5 @@
+#1 Real-time Windows Auth Log Taker
+# - Collects 4624/4625 events, extracts features, and scores them with both supervised and unsupervised models.
 import win32evtlog, win32con, win32api, queue, threading, xml.etree.ElementTree as ET
 
 event_queue = queue.Queue()
@@ -29,7 +31,7 @@ def parse_event(xml_str):
 
 threading.Thread(target=log_watcher, daemon=True).start()
 
-
+#2 Feature Extraction and Scoring
 
 from collections import defaultdict, deque
 import numpy as np, joblib, time
@@ -65,6 +67,7 @@ def process_event(event):
     score_if = -model_if.score_samples(X)[0]         # higher = more anomalous
     return {'user': user, 'score_rf': score_rf, 'score_if': score_if, **feats}
 
+#3 Main Loop: Process events and store results for Streamlit
 
 import streamlit as st, pandas as pd, time
 
