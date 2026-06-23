@@ -13,7 +13,7 @@ except ImportError:
     from Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[2] # Adjust as needed based on your project structure
 FEATURES_PATH = PROJECT_ROOT / "data" / "processed" / "features.csv"
 MODEL_PATH = PROJECT_ROOT / "models" / "xgboost_baseline.pkl"
 METRICS_PATH = PROJECT_ROOT / "results" / "metrics" / "xgboost_baseline_metrics.csv"
