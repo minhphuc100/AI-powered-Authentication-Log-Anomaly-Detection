@@ -110,3 +110,24 @@ Isolation Forest
 Output:
 Normal
 Anomaly (potential brute force or account abuse)
+
+
+
+Confusion matrix for supervised model: ( evaluate using confusion matrix to understand the trade-offs between catching true positives and avoiding false positives)
+                 Predicted Normal   Predicted Brute Force
+Actual Normal         TP                 FN
+Actual Brute Force    FP                 TN
+Confusion matrix for unsupervised model:
+                 Predicted Normal   Predicted Anomaly
+Actual Normal         TP                 FP
+Actual Anomaly       FN                 TN
+
+Evaluation Metrics:
+For the supervised model (XGBoost), we will evaluate using Precision, Recall, F1
+Score, and the confusion matrix to understand the trade-offs between catching true positives and avoiding false positives.
+For the unsupervised model (Isolation Forest), we will evaluate using Precision, Recall, F1 Score, and the confusion matrix to understand how well the model identifies anomalies while minimizing false positives.
+We will implement the data parsing, feature engineering, model training, and evaluation in Python using libraries
+such as pandas, scikit-learn, XGBoost, and matplotlib for visualization. We will also create a simple alert dashboard to display the results of our models in real-time.
+
+
+
