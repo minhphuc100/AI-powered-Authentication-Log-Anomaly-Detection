@@ -1,3 +1,7 @@
+Slide lam nhu chapter 9
+
+
+
 What my group gonna do: Authentication Log Anomaly Detection for Brute Force / Account Abuse
 
 Scope ?
@@ -130,4 +134,4 @@ We will implement the data parsing, feature engineering, model training, and eva
 such as pandas, scikit-learn, XGBoost, and matplotlib for visualization. We will also create a simple alert dashboard to display the results of our models in real-time.
 
 
-
+modify your Python training script to send the model and data to the GPU device instead of the CPU.
