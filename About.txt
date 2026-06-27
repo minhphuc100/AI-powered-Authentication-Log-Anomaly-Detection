@@ -135,3 +135,11 @@ such as pandas, scikit-learn, XGBoost, and matplotlib for visualization. We will
 
 
 modify your Python training script to send the model and data to the GPU device instead of the CPU.
+
+
+
+Xgboost ko can undersampling hoac oversampling 
+Sử dụng tham số scale_pos_weight thoi
+
+10% de valid trong xgboost la de
+voi moi la train (70 % do), 10% data se dc dua vao de check accuracy, sau do tu accuracy do, early-stopping-rounds se gioi han so cay neu accuracy ko tang thi se dung som
