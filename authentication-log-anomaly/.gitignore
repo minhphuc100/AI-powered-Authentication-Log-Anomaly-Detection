@@ -2,4 +2,4 @@ __pycache__/
 *.py[cod]
 models/*.pkl
 results/metrics/*.csv
-data/raw/*.txt 
+
