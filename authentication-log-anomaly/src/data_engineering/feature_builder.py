@@ -77,12 +77,21 @@ def _as_bool_int(value: object) -> int:
 
 def _time_features(seconds: int) -> dict[str, int]:
     seconds_in_day = seconds % SECONDS_PER_DAY
+    hour_of_day = seconds_in_day // 3_600
+    day_of_week = (seconds // SECONDS_PER_DAY) % 7
     return {
-        "hour_of_day": seconds_in_day // 3_600,
-        "day_of_week": (seconds // SECONDS_PER_DAY) % 7,
-        "is_business_hours": int(8 <= seconds_in_day // 3_600 <= 18),
-        "is_weekend": int(((seconds // SECONDS_PER_DAY) % 7) >= 5),
+        "hour_of_day": hour_of_day,
+        "day_of_week": day_of_week,
+        "is_business_hours": int(8 <= hour_of_day <= 18 and day_of_week <= 4),
     }
+
+
+def _is_failure(result: object, event_id: object) -> bool:
+    return result == "Fail" or event_id == 4625
+
+
+def _is_network_logon(logon_type: object) -> int:
+    return int(str(logon_type) in {"Network", "3", "8"})
 
 
 def build_features_stream(
@@ -96,17 +105,11 @@ def build_features_stream(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     failed_5m_user = WindowCounter(FIVE_MINUTES)
-    failed_5m_src = WindowCounter(FIVE_MINUTES)
+    failed_5m_ip = WindowCounter(FIVE_MINUTES)
     failed_1h_user = WindowCounter(ONE_HOUR)
     total_1h_user = WindowCounter(ONE_HOUR)
-    dst_1h_by_src = WindowDistinctCounter(ONE_HOUR)
-    src_1h_by_dst = WindowDistinctCounter(ONE_HOUR)
-    dst_1h_by_user = WindowDistinctCounter(ONE_HOUR)
-    users_1h_by_src = WindowDistinctCounter(ONE_HOUR)
-
-    seen_user_src: set[tuple[str, str]] = set()
-    seen_src_dst: set[tuple[str, str]] = set()
-    seen_user_dst: set[tuple[str, str]] = set()
+    src_ips_1h_by_user = WindowDistinctCounter(ONE_HOUR)
+    users_1h_by_ip = WindowDistinctCounter(ONE_HOUR)
 
     wrote_header = False
     total_rows = 0
@@ -129,82 +132,45 @@ def build_features_stream(
             last_time = current_time
 
             username = item.get("username")
-            src_username = item.get("src_username")
-            src_host = item.get("src_host")
-            destination_host = item.get("destination_host")
+            src_ip = item.get("src_host")
+            event_id = item.get("event_id")
+            logon_type = item.get("logon_type")
             result = item.get("result")
 
             for window in (
                 failed_5m_user,
-                failed_5m_src,
+                failed_5m_ip,
                 failed_1h_user,
                 total_1h_user,
-                dst_1h_by_src,
-                src_1h_by_dst,
-                dst_1h_by_user,
-                users_1h_by_src,
+                src_ips_1h_by_user,
+                users_1h_by_ip,
             ):
                 window.expire(current_time)
 
-            user_src_key = (src_username, src_host)
-            src_dst_key = (src_host, destination_host)
-            user_dst_key = (src_username, destination_host)
-
-            total_user_1h = total_1h_user.get(src_username)
-            failed_user_1h = failed_1h_user.get(src_username)
-            failure_rate_1h_user = round(failed_user_1h / total_user_1h, 4) if total_user_1h else 0.0
+            total_user_1h = total_1h_user.get(username)
+            failed_user_1h = failed_1h_user.get(username)
+            failure_rate_1h = round(failed_user_1h / total_user_1h, 4) if total_user_1h else 0.0
 
             feature_row = {
-                "timestamp": current_time,
-                "username": username,
-                "src_username": src_username,
-                "src_host": src_host,
-                "destination_host": destination_host,
-                "event_type": item.get("event_type"),
-                "event_id": item.get("event_id"),
-                "auth_type": item.get("auth_type"),
-                "logon_type": item.get("logon_type"),
-                "auth_orientation": item.get("auth_orientation"),
-                "result": result,
-                "failed_logins_5m_user": failed_5m_user.get(src_username),
-                "failed_logins_5m_src_host": failed_5m_src.get(src_host),
-                "failed_logins_1h_user": failed_user_1h,
-                "failure_rate_1h_user": failure_rate_1h_user,
-                "unique_destination_hosts_1h_per_src_host": dst_1h_by_src.nunique(src_host),
-                "unique_src_hosts_1h": src_1h_by_dst.nunique(destination_host),
-                "unique_destination_hosts_1h_per_user": dst_1h_by_user.nunique(src_username),
-                "unique_users_1h_per_src_host": users_1h_by_src.nunique(src_host),
-                "is_new_user_src": int(user_src_key not in seen_user_src),
-                "is_new_src_dst": int(src_dst_key not in seen_src_dst),
-                "is_new_user_dst": int(user_dst_key not in seen_user_dst),
-                "is_success": _as_bool_int(item.get("is_success")),
-                "is_fail": _as_bool_int(item.get("is_fail")),
-                "is_logon": _as_bool_int(item.get("is_logon")),
-                "is_logoff": _as_bool_int(item.get("is_logoff")),
-                "is_tgs": _as_bool_int(item.get("is_tgs")),
-                "is_machine_account": _as_bool_int(item.get("is_machine_account")),
+                "failed_logins_5m_user": failed_5m_user.get(username),
+                "unique_src_ip_1h": src_ips_1h_by_user.nunique(username),
+                "failed_logins_5m_ip": failed_5m_ip.get(src_ip),
+                "failure_rate_1h": failure_rate_1h,
+                "unique_users_1h_per_ip": users_1h_by_ip.nunique(src_ip),
                 **_time_features(current_time),
+                "is_network_logon": _is_network_logon(logon_type),
                 "label": _as_bool_int(item.get("label")),
             }
             rows.append(feature_row)
 
-            total_1h_user.add(current_time, src_username)
-            dst_1h_by_src.add(current_time, src_host, destination_host)
-            src_1h_by_dst.add(current_time, destination_host, src_host)
-            dst_1h_by_user.add(current_time, src_username, destination_host)
-            users_1h_by_src.add(current_time, src_host, src_username)
+            total_1h_user.add(current_time, username)
+            src_ips_1h_by_user.add(current_time, username, src_ip)
+            users_1h_by_ip.add(current_time, src_ip, username)
 
-            if result == "Fail":
-                failed_5m_user.add(current_time, src_username)
-                failed_5m_src.add(current_time, src_host)
-                failed_1h_user.add(current_time, src_username)
-
-            if not pd.isna(src_username) and not pd.isna(src_host):
-                seen_user_src.add(user_src_key)
-            if not pd.isna(src_host) and not pd.isna(destination_host):
-                seen_src_dst.add(src_dst_key)
-            if not pd.isna(src_username) and not pd.isna(destination_host):
-                seen_user_dst.add(user_dst_key)
+            if _is_failure(result, event_id):
+                failed_5m_user.add(current_time, username)
+                failed_5m_ip.add(current_time, src_ip)
+                failed_1h_user.add(current_time, username)
 
         features = pd.DataFrame(rows)
         features.to_csv(output_path, mode="w" if not wrote_header else "a", header=not wrote_header, index=False)
