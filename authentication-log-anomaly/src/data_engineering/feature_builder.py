@@ -13,6 +13,11 @@ FIVE_MINUTES = 300
 ONE_HOUR = 3_600
 SECONDS_PER_DAY = 86_400
 
+BRUTE_FORCE_THRESHOLD = 10
+SPRAY_THRESHOLD = 5
+FAILURE_RATE_THRESHOLD = 0.8
+POST_BRUTE_SUCCESS = 5
+
 
 class WindowCounter:
     def __init__(self, window_seconds: int):
@@ -94,6 +99,35 @@ def _is_network_logon(logon_type: object) -> int:
     return int(str(logon_type) in {"Network", "3", "8"})
 
 
+def _assign_rule_label(
+    existing_label: int,
+    event_id: object,
+    failed_logins_5m_user: int,
+    failed_logins_5m_ip: int,
+    failure_rate_1h: float,
+    unique_users_1h_per_ip: int,
+) -> int:
+    if existing_label == 1:
+        return 1
+
+    is_failed_login = event_id == 4625
+    is_successful_login = event_id == 4624
+
+    is_brute_force = failed_logins_5m_ip >= BRUTE_FORCE_THRESHOLD
+    is_password_spray = unique_users_1h_per_ip >= SPRAY_THRESHOLD
+    is_high_failure_rate = is_failed_login and failure_rate_1h >= FAILURE_RATE_THRESHOLD
+    is_success_after_failures = (
+        is_successful_login and failed_logins_5m_user >= POST_BRUTE_SUCCESS
+    )
+
+    return int(
+        is_brute_force
+        or is_password_spray
+        or is_high_failure_rate
+        or is_success_after_failures
+    )
+
+
 def build_features_stream(
     input_path: Path = PROCESSED_PATH,
     output_path: Path = FEATURES_PATH,
@@ -150,16 +184,28 @@ def build_features_stream(
             total_user_1h = total_1h_user.get(username)
             failed_user_1h = failed_1h_user.get(username)
             failure_rate_1h = round(failed_user_1h / total_user_1h, 4) if total_user_1h else 0.0
+            failed_logins_5m_user = failed_5m_user.get(username)
+            unique_src_ip_1h = src_ips_1h_by_user.nunique(username)
+            failed_logins_5m_ip = failed_5m_ip.get(src_ip)
+            unique_users_1h_per_ip = users_1h_by_ip.nunique(src_ip)
+            label = _assign_rule_label(
+                existing_label=_as_bool_int(item.get("label")),
+                event_id=event_id,
+                failed_logins_5m_user=failed_logins_5m_user,
+                failed_logins_5m_ip=failed_logins_5m_ip,
+                failure_rate_1h=failure_rate_1h,
+                unique_users_1h_per_ip=unique_users_1h_per_ip,
+            )
 
             feature_row = {
-                "failed_logins_5m_user": failed_5m_user.get(username),
-                "unique_src_ip_1h": src_ips_1h_by_user.nunique(username),
-                "failed_logins_5m_ip": failed_5m_ip.get(src_ip),
+                "failed_logins_5m_user": failed_logins_5m_user,
+                "unique_src_ip_1h": unique_src_ip_1h,
+                "failed_logins_5m_ip": failed_logins_5m_ip,
                 "failure_rate_1h": failure_rate_1h,
-                "unique_users_1h_per_ip": users_1h_by_ip.nunique(src_ip),
+                "unique_users_1h_per_ip": unique_users_1h_per_ip,
                 **_time_features(current_time),
                 "is_network_logon": _is_network_logon(logon_type),
-                "label": _as_bool_int(item.get("label")),
+                "label": label,
             }
             rows.append(feature_row)
 
