@@ -1,4 +1,9 @@
-from .parser import parse_windows_auth_logs
+from .feature_builder import build_features, build_features_stream
+from .parser import load_redteam, parse_file
+
 __all__ = [
-    'parse_windows_auth_logs'
+    "build_features",
+    "build_features_stream",
+    "load_redteam",
+    "parse_file",
 ]
