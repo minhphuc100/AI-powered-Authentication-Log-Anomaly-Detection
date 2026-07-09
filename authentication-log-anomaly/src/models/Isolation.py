@@ -1,140 +1,99 @@
-import numpy as np
+from __future__ import annotations
+
+from pathlib import Path
+
+import joblib
 import pandas as pd
 from sklearn.ensemble import IsolationForest
-from sklearn.metrics import (
-    classification_report, confusion_matrix,
-    roc_auc_score, precision_recall_curve, average_precision_score
-)
-from sklearn.preprocessing import LabelEncoder
-import warnings
-warnings.filterwarnings("ignore")
+from sklearn.model_selection import train_test_split
+
+try:
+    from .Xgboostbaseline import FEATURE_COLUMNS, FEATURES_PATH, load_features, prepare_xy
+    from .Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
+except ImportError:
+    from Xgboostbaseline import FEATURE_COLUMNS, FEATURES_PATH, load_features, prepare_xy
+    from Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
 
 
-print("=" * 60)
-print("ISOLATION FOREST — SYSTEM LOG ANOMALY DETECTION")
-print("=" * 60)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MODEL_PATH = PROJECT_ROOT / "models" / "isolation_forest.pkl"
+METRICS_PATH = PROJECT_ROOT / "results" / "metrics" / "isolation_forest_metrics.csv"
+IMPORTANCE_PATH = PROJECT_ROOT / "results" / "metrics" / "isolation_forest_feature_importance.csv"
 
-df = pd.read_csv("data/processed/features.csv")
-print(f"\n[1] Dataset loaded: {len(df)} samples, {df.shape[1]} columns")
 
-le = LabelEncoder()
-df["event_type_enc"] = le.fit_transform(df["event_type"].astype(str))
+def save_feature_importance(model: IsolationForest, output_path: Path) -> pd.DataFrame:
+    tree_importances = pd.DataFrame(
+        [tree.feature_importances_ for tree in model.estimators_],
+        columns=FEATURE_COLUMNS,
+    )
+    importance = (
+        tree_importances.mean()
+        .rename_axis("feature")
+        .reset_index(name="importance")
+        .sort_values("importance", ascending=False)
+    )
 
-FEATURE_COLS = [
-    "event_id",
-    "failed_logins_5m_user",
-    "unique_src_ip_1h",
-    "failed_logins_5m_ip",
-    "failure_rate_1h",
-    "unique_users_1h_per_ip",
-    "hour_of_day",
-    "day_of_week",
-    "is_business_hours",
-    "is_network_logon",
-    "event_type_enc",
-]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    importance.to_csv(output_path, index=False)
+    return importance
 
-X = df[FEATURE_COLS].fillna(0).values
-y_true = df["label"].values       
 
-n_total   = len(X)
-n_anomaly = int(y_true.sum())
-n_normal  = n_total - n_anomaly
-contamination = max(n_anomaly / n_total, 0.01)
+def train_isolation_model(
+    features_path: Path = FEATURES_PATH,
+    model_path: Path = MODEL_PATH,
+    metrics_path: Path = METRICS_PATH,
+    importance_path: Path = IMPORTANCE_PATH,
+) -> dict:
+    """Train an Isolation Forest model for auth-log anomaly detection."""
+    df = load_features(features_path)
+    X, y = prepare_xy(df)
 
-print(f"\n[2] Feature matrix: {X.shape}")
-print(f"    Normal  : {n_normal}")
-print(f"    Anomaly : {n_anomaly}")
-print(f"    Contamination estimate: {contamination:.4f}")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.2,
+        stratify=y,
+        random_state=42,
+    )
 
-iso = IsolationForest(
-    n_estimators=300,
-    contamination=contamination,
-    max_samples="auto",
-    random_state=42,
-    n_jobs=-1,
-)
-iso.fit(X)
+    contamination = max(float(y_train.mean()), 0.01)
+    contamination = min(contamination, 0.5)
 
-raw_pred  = iso.predict(X)
-scores    = iso.decision_function(X)  
+    model = IsolationForest(
+        n_estimators=300,
+        contamination=contamination,
+        max_samples="auto",
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(X_train)
 
-y_pred_bin = (raw_pred == -1).astype(int)  
+    raw_pred = model.predict(X_test)
+    y_pred = (raw_pred == -1).astype(int)
+    y_score = -model.decision_function(X_test)
 
-scores_anomaly = -scores
+    metrics = calculate_security_metrics(
+        y_test,
+        y_pred,
+        y_score,
+        model_name="isolation_forest",
+    )
+    metrics["contamination"] = contamination
 
-print("\n" + "=" * 60)
-print("[3] CLASSIFICATION REPORT")
-print("=" * 60)
-print(classification_report(
-    y_true, y_pred_bin,
-    target_names=["Normal (0)", "Anomaly (1)"],
-    digits=4,
-    zero_division=0,
-))
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, model_path)
+    save_metrics(metrics, metrics_path)
+    importance = save_feature_importance(model, importance_path)
 
-# Confusion matrix
-cm = confusion_matrix(y_true, y_pred_bin)
-tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+    print_metrics(metrics)
+    print("\nTop feature importance")
+    print(importance.head(10).to_string(index=False))
+    print(f"Saved model to: {model_path}")
+    print(f"Saved metrics to: {metrics_path}")
+    print(f"Saved feature importance to: {importance_path}")
 
-print("=" * 60)
-print("[4] CONFUSION MATRIX")
-print("=" * 60)
-print(f"{'':20s}  Pred Normal  Pred Anomaly")
-print(f"  Actual Normal  :    {tn:6d}       {fp:6d}")
-print(f"  Actual Anomaly :    {fn:6d}       {tp:6d}")
+    return metrics
 
-# ROC-AUC & PR-AUC
-if n_anomaly > 0 and n_anomaly < n_total:
-    roc_auc = roc_auc_score(y_true, scores_anomaly)
-    ap      = average_precision_score(y_true, scores_anomaly)
-    precision_arr, recall_arr, _ = precision_recall_curve(y_true, scores_anomaly)
-    print(f"\n{'=' * 60}")
-    print("[5] RANKING METRICS")
-    print("=" * 60)
-    print(f"  ROC-AUC Score          : {roc_auc:.4f}")
-    print(f"  Average Precision (AP) : {ap:.4f}")
-else:
-    print("\n  (Không đủ nhãn để tính ROC-AUC)")
 
-print(f"\n{'=' * 60}")
-print("[6] ANOMALY SCORE STATISTICS (lower raw score = more anomalous)")
-print("=" * 60)
-print(f"  Normal samples  — mean: {scores[y_true==0].mean():.4f}  "
-      f"std: {scores[y_true==0].std():.4f}")
-if n_anomaly > 0:
-    print(f"  Anomaly samples — mean: {scores[y_true==1].mean():.4f}  "
-          f"std: {scores[y_true==1].std():.4f}")
-
-df["anomaly_score"] = scores_anomaly
-df["predicted"]     = y_pred_bin
-
-top_anomalies = (
-    df[df["predicted"] == 1]
-    .sort_values("anomaly_score", ascending=False)
-    .head(20)
-)
-
-print(f"\n{'=' * 60}")
-print("[7] TOP 20 PREDICTED ANOMALIES (by score)")
-print("=" * 60)
-display_cols = ["timestamp", "username", "src_ip", "event_type",
-                "failed_logins_5m_user", "failed_logins_5m_ip",
-                "failure_rate_1h", "hour_of_day", "anomaly_score", "label"]
-available = [c for c in display_cols if c in df.columns]
-print(top_anomalies[available].to_string(index=False))
-
-fp_rows = df[(df["predicted"] == 1) & (df["label"] == 0)]
-fn_rows = df[(df["predicted"] == 0) & (df["label"] == 1)]
-print(f"\n{'=' * 60}")
-print("[8] ERROR ANALYSIS")
-print("=" * 60)
-print(f"  False Positives (normal flagged as anomaly) : {len(fp_rows)}")
-print(f"  False Negatives (anomaly missed)            : {len(fn_rows)}")
-if len(fn_rows) > 0:
-    print("\n  Missed anomalies:")
-    print(fn_rows[available].to_string(index=False))
-
-print(f"\n{'=' * 60}")
-print("DONE.")
-print("=" * 60)
+if __name__ == "__main__":
+    train_isolation_model()

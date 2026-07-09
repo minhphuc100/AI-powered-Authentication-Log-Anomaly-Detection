@@ -1,193 +1,258 @@
-# src/data_engineering/feature_builder.py
+from collections import Counter, defaultdict, deque
+from pathlib import Path
+from typing import Deque, Hashable
 
 import pandas as pd
-import numpy as np
-from pathlib import Path
+
 
 PROCESSED_PATH = Path("data/processed/parsed_auth_logs.csv")
-FEATURES_PATH  = Path("data/processed/features.csv")
+FEATURES_PATH = Path("data/processed/features.csv")
 
-# ============================================================
-# Ngưỡng gắn nhãn - chỉnh ở đây nếu muốn thay đổi độ nhạy
-# ============================================================
-BRUTE_FORCE_THRESHOLD    = 10   # >= 10 lần thất bại từ 1 IP trong 5 phút
-SPRAY_THRESHOLD          = 5    # >= 5 user khác nhau từ 1 IP trong 1 giờ
-FAILURE_RATE_THRESHOLD   = 0.8  # >= 80% tỉ lệ thất bại trong 1 giờ
-POST_BRUTE_SUCCESS       = 5    # login thành công sau >= 5 lần thất bại
+CHUNK_SIZE = 500_000
+FIVE_MINUTES = 300
+ONE_HOUR = 3_600
+SECONDS_PER_DAY = 86_400
+
+BRUTE_FORCE_THRESHOLD = 10
+SPRAY_THRESHOLD = 5
+FAILURE_RATE_THRESHOLD = 0.8
+POST_BRUTE_SUCCESS = 5
+
+
+class WindowCounter:
+    def __init__(self, window_seconds: int):
+        self.window_seconds = window_seconds
+        self.events: Deque[tuple[int, Hashable]] = deque()
+        self.counts: Counter[Hashable] = Counter()
+
+    def expire(self, current_time: int) -> None:
+        cutoff = current_time - self.window_seconds
+        while self.events and self.events[0][0] < cutoff:
+            _, key = self.events.popleft()
+            self.counts[key] -= 1
+            if self.counts[key] <= 0:
+                del self.counts[key]
+
+    def add(self, current_time: int, key: Hashable) -> None:
+        if pd.isna(key):
+            return
+        self.events.append((current_time, key))
+        self.counts[key] += 1
+
+    def get(self, key: Hashable) -> int:
+        if pd.isna(key):
+            return 0
+        return int(self.counts.get(key, 0))
+
+
+class WindowDistinctCounter:
+    def __init__(self, window_seconds: int):
+        self.window_seconds = window_seconds
+        self.events: Deque[tuple[int, Hashable, Hashable]] = deque()
+        self.counts_by_group: dict[Hashable, Counter[Hashable]] = defaultdict(Counter)
+
+    def expire(self, current_time: int) -> None:
+        cutoff = current_time - self.window_seconds
+        while self.events and self.events[0][0] < cutoff:
+            _, group_key, value_key = self.events.popleft()
+            group_counts = self.counts_by_group[group_key]
+            group_counts[value_key] -= 1
+            if group_counts[value_key] <= 0:
+                del group_counts[value_key]
+            if not group_counts:
+                del self.counts_by_group[group_key]
+
+    def add(self, current_time: int, group_key: Hashable, value_key: Hashable) -> None:
+        if pd.isna(group_key) or pd.isna(value_key):
+            return
+        self.events.append((current_time, group_key, value_key))
+        self.counts_by_group[group_key][value_key] += 1
+
+    def nunique(self, group_key: Hashable) -> int:
+        if pd.isna(group_key):
+            return 0
+        return len(self.counts_by_group.get(group_key, ()))
+
+
+def _as_bool_int(value: object) -> int:
+    if pd.isna(value):
+        return 0
+    return int(value)
+
+
+def _time_features(seconds: int) -> dict[str, int]:
+    seconds_in_day = seconds % SECONDS_PER_DAY
+    hour_of_day = seconds_in_day // 3_600
+    day_of_week = (seconds // SECONDS_PER_DAY) % 7
+    return {
+        "hour_of_day": hour_of_day,
+        "day_of_week": day_of_week,
+        "is_business_hours": int(8 <= hour_of_day <= 18 and day_of_week <= 4),
+    }
+
+
+def _is_failure(result: object, event_id: object) -> bool:
+    return result == "Fail" or event_id == 4625
+
+
+def _is_network_logon(logon_type: object) -> int:
+    return int(str(logon_type) in {"Network", "3", "8"})
+
+
+def _assign_rule_label(
+    existing_label: int,
+    event_id: object,
+    failed_logins_5m_user: int,
+    failed_logins_5m_ip: int,
+    failure_rate_1h: float,
+    unique_users_1h_per_ip: int,
+) -> int:
+    if existing_label == 1:
+        return 1
+
+    is_failed_login = event_id == 4625
+    is_successful_login = event_id == 4624
+
+    is_brute_force = failed_logins_5m_ip >= BRUTE_FORCE_THRESHOLD
+    is_password_spray = unique_users_1h_per_ip >= SPRAY_THRESHOLD
+    is_high_failure_rate = is_failed_login and failure_rate_1h >= FAILURE_RATE_THRESHOLD
+    is_success_after_failures = (
+        is_successful_login and failed_logins_5m_user >= POST_BRUTE_SUCCESS
+    )
+
+    return int(
+        is_brute_force
+        or is_password_spray
+        or is_high_failure_rate
+        or is_success_after_failures
+    )
+
+
+def build_features_stream(
+    input_path: Path = PROCESSED_PATH,
+    output_path: Path = FEATURES_PATH,
+    chunksize: int = CHUNK_SIZE,
+) -> None:
+    if not input_path.exists():
+        raise FileNotFoundError(f"Parsed auth log not found: {input_path}. Run parser.py first.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    failed_5m_user = WindowCounter(FIVE_MINUTES)
+    failed_5m_ip = WindowCounter(FIVE_MINUTES)
+    failed_1h_user = WindowCounter(ONE_HOUR)
+    total_1h_user = WindowCounter(ONE_HOUR)
+    src_ips_1h_by_user = WindowDistinctCounter(ONE_HOUR)
+    users_1h_by_ip = WindowDistinctCounter(ONE_HOUR)
+
+    wrote_header = False
+    total_rows = 0
+    total_labels = 0
+    last_time = None
+
+    reader = pd.read_csv(input_path, chunksize=chunksize)
+    for chunk_index, chunk in enumerate(reader, start=1):
+        rows: list[dict[str, object]] = []
+
+        for row in chunk.itertuples(index=False):
+            item = row._asdict()
+            current_time = int(item["timestamp"])
+
+            if last_time is not None and current_time < last_time:
+                raise ValueError(
+                    "Parsed data must be sorted by time for streaming features. "
+                    "Sort the auth log before feature building."
+                )
+            last_time = current_time
+
+            username = item.get("username")
+            src_ip = item.get("src_host")
+            event_id = item.get("event_id")
+            logon_type = item.get("logon_type")
+            result = item.get("result")
+
+            for window in (
+                failed_5m_user,
+                failed_5m_ip,
+                failed_1h_user,
+                total_1h_user,
+                src_ips_1h_by_user,
+                users_1h_by_ip,
+            ):
+                window.expire(current_time)
+
+            total_user_1h = total_1h_user.get(username)
+            failed_user_1h = failed_1h_user.get(username)
+            failure_rate_1h = round(failed_user_1h / total_user_1h, 4) if total_user_1h else 0.0
+            failed_logins_5m_user = failed_5m_user.get(username)
+            unique_src_ip_1h = src_ips_1h_by_user.nunique(username)
+            failed_logins_5m_ip = failed_5m_ip.get(src_ip)
+            unique_users_1h_per_ip = users_1h_by_ip.nunique(src_ip)
+            label = _assign_rule_label(
+                existing_label=_as_bool_int(item.get("label")),
+                event_id=event_id,
+                failed_logins_5m_user=failed_logins_5m_user,
+                failed_logins_5m_ip=failed_logins_5m_ip,
+                failure_rate_1h=failure_rate_1h,
+                unique_users_1h_per_ip=unique_users_1h_per_ip,
+            )
+
+            feature_row = {
+                "failed_logins_5m_user": failed_logins_5m_user,
+                "unique_src_ip_1h": unique_src_ip_1h,
+                "failed_logins_5m_ip": failed_logins_5m_ip,
+                "failure_rate_1h": failure_rate_1h,
+                "unique_users_1h_per_ip": unique_users_1h_per_ip,
+                **_time_features(current_time),
+                "is_network_logon": _is_network_logon(logon_type),
+                "label": label,
+            }
+            rows.append(feature_row)
+
+            total_1h_user.add(current_time, username)
+            src_ips_1h_by_user.add(current_time, username, src_ip)
+            users_1h_by_ip.add(current_time, src_ip, username)
+
+            if _is_failure(result, event_id):
+                failed_5m_user.add(current_time, username)
+                failed_5m_ip.add(current_time, src_ip)
+                failed_1h_user.add(current_time, username)
+
+        features = pd.DataFrame(rows)
+        features.to_csv(output_path, mode="w" if not wrote_header else "a", header=not wrote_header, index=False)
+        wrote_header = True
+
+        total_rows += len(features)
+        total_labels += int(features["label"].sum()) if not features.empty else 0
+        print(
+            f"[feature_builder] chunk {chunk_index:,}: rows={len(features):,}, "
+            f"labels={int(features['label'].sum()) if not features.empty else 0:,}, "
+            f"total={total_rows:,}"
+        )
+
+    print(f"[feature_builder] Saved {total_rows:,} rows -> {output_path}")
+    print(f"[feature_builder] Labels in feature file: {total_labels:,}")
 
 
 def load(path: Path = PROCESSED_PATH) -> pd.DataFrame:
     df = pd.read_csv(path)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], dayfirst=False)
-    df = df.sort_values("timestamp").reset_index(drop=True)
     print(f"[feature_builder] Loaded {len(df):,} rows")
     return df
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tính time-window features cho từng event.
-    Đây là core của anomaly detection pipeline.
-    """
-    df = df.set_index("timestamp").sort_index()
-    results = []
-
-    total = len(df)
-    for i, (idx, row) in enumerate(df.iterrows()):
-        if i % 500 == 0:
-            print(f"[feature_builder] Processing {i:,}/{total:,}...")
-
-        user = row["username"]
-        ip   = row["src_ip"]
-
-        # Time windows
-        w5m = df.loc[idx - pd.Timedelta("5min") : idx]
-        w1h = df.loc[idx - pd.Timedelta("1h")   : idx]
-
-        # --------------------------------------------------
-        # FEATURE 1: Số lần thất bại trong 5 phút (per user)
-        # Phát hiện: brute force nhắm vào 1 tài khoản
-        # --------------------------------------------------
-        failed_5m_user = 0
-        if pd.notna(user):
-            failed_5m_user = len(w5m[
-                (w5m["username"] == user) & (w5m["event_id"] == 4625)
-            ])
-
-        # --------------------------------------------------
-        # FEATURE 2: Số IP khác nhau tấn công 1 user trong 1 giờ
-        # Phát hiện: distributed brute force (nhiều máy cùng tấn công)
-        # --------------------------------------------------
-        unique_ip_1h = 0
-        if pd.notna(user):
-            unique_ip_1h = w1h[w1h["username"] == user]["src_ip"].nunique()
-
-        # --------------------------------------------------
-        # FEATURE 3: Số lần thất bại từ 1 IP trong 5 phút
-        # Phát hiện: brute force từ 1 nguồn tấn công
-        # --------------------------------------------------
-        failed_5m_ip = 0
-        if pd.notna(ip):
-            failed_5m_ip = len(w5m[
-                (w5m["src_ip"] == ip) & (w5m["event_id"] == 4625)
-            ])
-
-        # --------------------------------------------------
-        # FEATURE 4: Tỉ lệ thất bại / tổng login trong 1 giờ
-        # Phát hiện: tỉ lệ cao bất thường dù số lần ít
-        # --------------------------------------------------
-        failure_rate_1h = 0.0
-        if pd.notna(user):
-            total_1h = len(w1h[w1h["username"] == user])
-            fail_1h  = len(w1h[
-                (w1h["username"] == user) & (w1h["event_id"] == 4625)
-            ])
-            failure_rate_1h = round(fail_1h / total_1h, 4) if total_1h > 0 else 0.0
-
-        # --------------------------------------------------
-        # FEATURE 5: Số user khác nhau bị tấn công từ 1 IP trong 1 giờ
-        # Phát hiện: password spray (1 IP thử nhiều tài khoản)
-        # --------------------------------------------------
-        unique_users_1h_per_ip = 0
-        if pd.notna(ip):
-            unique_users_1h_per_ip = w1h[
-                w1h["src_ip"] == ip
-            ]["username"].nunique()
-
-        # --------------------------------------------------
-        # FEATURE 6-9: Thời gian (behavior baseline)
-        # --------------------------------------------------
-        hour_of_day       = idx.hour
-        day_of_week       = idx.dayofweek
-        is_business_hours = int((8 <= idx.hour <= 18) and (idx.dayofweek <= 4))
-        is_network_logon  = int(str(row.get("logon_type", "")) in ["3", "8"])
-
-        results.append({
-            # --- Metadata ---
-            "timestamp":               idx,
-            "username":                user,
-            "src_ip":                  ip,
-            "event_id":                row["event_id"],
-            "event_type":              row["event_type"],
-            # --- Features ---
-            "failed_logins_5m_user":   failed_5m_user,
-            "unique_src_ip_1h":        unique_ip_1h,
-            "failed_logins_5m_ip":     failed_5m_ip,
-            "failure_rate_1h":         failure_rate_1h,
-            "unique_users_1h_per_ip":  unique_users_1h_per_ip,
-            "hour_of_day":             hour_of_day,
-            "day_of_week":             day_of_week,
-            "is_business_hours":       is_business_hours,
-            "is_network_logon":        is_network_logon,
-        })
-
-    return pd.DataFrame(results)
-
-
-def assign_label(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Gắn nhãn dựa trên PATTERN (time-window features),
-    không phải từng event đơn lẻ.
-
-    Label:
-        0 = normal
-        1 = anomaly (brute force / password spray / suspicious)
-
-    Lý do không dùng event_id == 4625 làm nhãn trực tiếp:
-        - 1 lần gõ sai mật khẩu cũng bị label = 1 → quá nhạy
-        - Không capture được pattern tấn công thật sự
-    """
-    df = df.copy()
-    df["label"] = 0  # mặc định: normal
-
-    # --- Rule 1: Brute force từ 1 IP ---
-    # Dấu hiệu: >= 10 lần thất bại từ cùng 1 IP trong 5 phút
-    mask_bf = df["failed_logins_5m_ip"] >= BRUTE_FORCE_THRESHOLD
-    df.loc[mask_bf, "label"] = 1
-
-    # --- Rule 2: Password Spray ---
-    # Dấu hiệu: 1 IP thử >= 5 user khác nhau trong 1 giờ
-    mask_spray = df["unique_users_1h_per_ip"] >= SPRAY_THRESHOLD
-    df.loc[mask_spray, "label"] = 1
-
-    # --- Rule 3: Tỉ lệ thất bại cao ---
-    # Dấu hiệu: >= 80% login là thất bại trong 1 giờ
-    mask_rate = (
-        (df["failure_rate_1h"] >= FAILURE_RATE_THRESHOLD) &
-        (df["event_id"] == 4625)
-    )
-    df.loc[mask_rate, "label"] = 1
-
-    # --- Rule 4: Login thành công SAU brute force ---
-    # Đây là dấu hiệu nguy hiểm nhất: tấn công thành công
-    mask_post = (
-        (df["event_id"] == 4624) &
-        (df["failed_logins_5m_user"] >= POST_BRUTE_SUCCESS)
-    )
-    df.loc[mask_post, "label"] = 1
-
-    # In thống kê nhãn
-    counts = df["label"].value_counts()
-    total  = len(df)
-    print(f"\n[feature_builder] Label distribution:")
-    print(f"  Normal  (0): {counts.get(0, 0):,}  ({counts.get(0,0)/total*100:.1f}%)")
-    print(f"  Anomaly (1): {counts.get(1, 0):,}  ({counts.get(1,0)/total*100:.1f}%)")
-
-    return df
-
-
-def save(df: pd.DataFrame, path: Path = FEATURES_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
-    print(f"\n[feature_builder] Saved {len(df):,} rows → {path}")
-
-
-def run():
-    df       = load()
-    features = build_features(df)
-    features = assign_label(features)
-    save(features)
+    temp_input = FEATURES_PATH.parent / "_tmp_parsed_for_features.csv"
+    temp_output = FEATURES_PATH.parent / "_tmp_features.csv"
+    df.to_csv(temp_input, index=False)
+    build_features_stream(temp_input, temp_output, chunksize=len(df) or 1)
+    features = pd.read_csv(temp_output)
+    temp_input.unlink(missing_ok=True)
+    temp_output.unlink(missing_ok=True)
     return features
+
+
+def run() -> None:
+    build_features_stream()
 
 
 if __name__ == "__main__":
