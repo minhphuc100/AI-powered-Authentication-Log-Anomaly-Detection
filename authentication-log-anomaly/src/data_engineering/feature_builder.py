@@ -75,19 +75,8 @@ def _as_bool_int(value: object) -> int:
     return int(value)
 
 
-def _time_features(seconds: int) -> dict[str, int]:
-    seconds_in_day = seconds % SECONDS_PER_DAY
-    hour_of_day = seconds_in_day // 3_600
-    day_of_week = (seconds // SECONDS_PER_DAY) % 7
-    return {
-        "hour_of_day": hour_of_day,
-        "day_of_week": day_of_week,
-        "is_business_hours": int(8 <= hour_of_day <= 18 and day_of_week <= 4),
-    }
-
-
-def _is_failure(result: object, event_id: object) -> bool:
-    return result == "Fail" or event_id == 4625
+def _hour_of_day(seconds: int) -> int:
+    return (seconds % SECONDS_PER_DAY) // 3_600
 
 
 def _is_network_logon(logon_type: object) -> int:
@@ -104,12 +93,11 @@ def build_features_stream(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    failed_5m_user = WindowCounter(FIVE_MINUTES)
-    failed_5m_ip = WindowCounter(FIVE_MINUTES)
-    failed_1h_user = WindowCounter(ONE_HOUR)
-    total_1h_user = WindowCounter(ONE_HOUR)
-    src_ips_1h_by_user = WindowDistinctCounter(ONE_HOUR)
-    users_1h_by_ip = WindowDistinctCounter(ONE_HOUR)
+    attempts_5m_by_user = WindowCounter(FIVE_MINUTES)
+    src_computers_1h_by_user = WindowDistinctCounter(ONE_HOUR)
+    users_1h_by_src_computer = WindowDistinctCounter(ONE_HOUR)
+    dst_computers_1h_by_user = WindowDistinctCounter(ONE_HOUR)
+    dst_users_1h_by_src_computer = WindowDistinctCounter(ONE_HOUR)
 
     wrote_header = False
     total_rows = 0
@@ -131,51 +119,40 @@ def build_features_stream(
                 )
             last_time = current_time
 
-            username = item.get("username")
-            src_ip = item.get("src_host")
-            event_id = item.get("event_id")
+            src_username = item.get("src_username")
+            dst_username = item.get("username")
+            src_computer = item.get("src_host")
+            dst_computer = item.get("destination_host")
             logon_type = item.get("logon_type")
-            result = item.get("result")
 
             for window in (
-                failed_5m_user,
-                failed_5m_ip,
-                failed_1h_user,
-                total_1h_user,
-                src_ips_1h_by_user,
-                users_1h_by_ip,
+                attempts_5m_by_user,
+                src_computers_1h_by_user,
+                users_1h_by_src_computer,
+                dst_computers_1h_by_user,
+                dst_users_1h_by_src_computer,
             ):
                 window.expire(current_time)
 
-            total_user_1h = total_1h_user.get(username)
-            failed_user_1h = failed_1h_user.get(username)
-            failure_rate_1h = round(failed_user_1h / total_user_1h, 4) if total_user_1h else 0.0
-            failed_logins_5m_user = failed_5m_user.get(username)
-            unique_src_ip_1h = src_ips_1h_by_user.nunique(username)
-            failed_logins_5m_ip = failed_5m_ip.get(src_ip)
-            unique_users_1h_per_ip = users_1h_by_ip.nunique(src_ip)
             label = _as_bool_int(item.get("label"))
 
             feature_row = {
-                "failed_logins_5m_user": failed_logins_5m_user,
-                "unique_src_ip_1h": unique_src_ip_1h,
-                "failed_logins_5m_ip": failed_logins_5m_ip,
-                "failure_rate_1h": failure_rate_1h,
-                "unique_users_1h_per_ip": unique_users_1h_per_ip,
-                **_time_features(current_time),
+                "auth_attempts_5m_per_user": attempts_5m_by_user.get(src_username),
+                "unique_src_computers_1h_per_user": src_computers_1h_by_user.nunique(src_username),
+                "unique_users_1h_per_src_computer": users_1h_by_src_computer.nunique(src_computer),
+                "unique_dst_computers_1h_per_user": dst_computers_1h_by_user.nunique(src_username),
+                "unique_dst_users_1h_per_src_computer": dst_users_1h_by_src_computer.nunique(src_computer),
+                "hour_of_day": _hour_of_day(current_time),
                 "is_network_logon": _is_network_logon(logon_type),
                 "label": label,
             }
             rows.append(feature_row)
 
-            total_1h_user.add(current_time, username)
-            src_ips_1h_by_user.add(current_time, username, src_ip)
-            users_1h_by_ip.add(current_time, src_ip, username)
-
-            if _is_failure(result, event_id):
-                failed_5m_user.add(current_time, username)
-                failed_5m_ip.add(current_time, src_ip)
-                failed_1h_user.add(current_time, username)
+            attempts_5m_by_user.add(current_time, src_username)
+            src_computers_1h_by_user.add(current_time, src_username, src_computer)
+            users_1h_by_src_computer.add(current_time, src_computer, src_username)
+            dst_computers_1h_by_user.add(current_time, src_username, dst_computer)
+            dst_users_1h_by_src_computer.add(current_time, src_computer, dst_username)
 
         features = pd.DataFrame(rows)
         features.to_csv(output_path, mode="w" if not wrote_header else "a", header=not wrote_header, index=False)
