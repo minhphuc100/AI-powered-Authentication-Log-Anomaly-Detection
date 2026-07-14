@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from cProfile import label
 from pathlib import Path
 
 import joblib
@@ -19,15 +20,13 @@ MODEL_PATH = PROJECT_ROOT / "models" / "xgboost_baseline.pkl"
 METRICS_PATH = PROJECT_ROOT / "results" / "metrics" / "xgboost_baseline_metrics.csv"
 
 FEATURE_COLUMNS = [
-    "failed_logins_5m_user",
-    "unique_src_ip_1h",
-    "failed_logins_5m_ip",
-    "failure_rate_1h",
-    "unique_users_1h_per_ip",
+    "auth_attempts_5m_per_user",
+    "unique_src_computers_1h_per_user",
+    "unique_users_1h_per_src_computer",
+    "unique_dst_computers_1h_per_user",
+    "unique_dst_users_1h_per_src_computer",
     "hour_of_day",
-    "day_of_week",
-    "is_business_hours",
-    "is_network_logon",
+    "is_network_logon"
 ]
 
 
