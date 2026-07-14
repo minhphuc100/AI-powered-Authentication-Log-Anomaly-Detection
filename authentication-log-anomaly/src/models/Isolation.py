@@ -1,3 +1,5 @@
+"""Isolation Forest model for authentication-log anomaly detection."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -22,16 +24,12 @@ IMPORTANCE_PATH = PROJECT_ROOT / "results" / "metrics" / "isolation_forest_featu
 
 
 def save_feature_importance(model: IsolationForest, output_path: Path) -> pd.DataFrame:
-    tree_importances = pd.DataFrame(
+    """Save mean split importance across all Isolation Forest trees."""
+    importance = pd.DataFrame(
         [tree.feature_importances_ for tree in model.estimators_],
         columns=FEATURE_COLUMNS,
-    )
-    importance = (
-        tree_importances.mean()
-        .rename_axis("feature")
-        .reset_index(name="importance")
-        .sort_values("importance", ascending=False)
-    )
+    ).mean().rename_axis("feature").reset_index(name="importance")
+    importance = importance.sort_values("importance", ascending=False)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     importance.to_csv(output_path, index=False)
@@ -44,7 +42,11 @@ def train_isolation_model(
     metrics_path: Path = METRICS_PATH,
     importance_path: Path = IMPORTANCE_PATH,
 ) -> dict:
-    """Train an Isolation Forest model for auth-log anomaly detection."""
+    """Train and evaluate Isolation Forest using the standard features.csv file.
+
+    The model is fitted only on normal training events, so anomaly labels are not
+    leaked into the unsupervised model.  Labels are used solely for evaluation.
+    """
     df = load_features(features_path)
     X, y = prepare_xy(df)
 
@@ -56,29 +58,35 @@ def train_isolation_model(
         random_state=42,
     )
 
-    contamination = max(float(y_train.mean()), 0.01)
-    contamination = min(contamination, 0.5)
+    X_normal_train = X_train.loc[y_train == 0]
+    if X_normal_train.empty:
+        raise ValueError("Isolation Forest requires at least one normal training sample.")
 
+    # Use the observed training anomaly rate to choose the prediction cutoff,
+    # while fitting the estimator on normal events only.
+    contamination = max(float((y_train == 1).mean()), 0.001)
+    contamination = min(contamination, 0.5)
     model = IsolationForest(
-        n_estimators=300,
+        n_estimators=200,
         contamination=contamination,
-        max_samples="auto",
         random_state=42,
         n_jobs=-1,
     )
-    model.fit(X_train)
+    model.fit(X_normal_train)
 
-    raw_pred = model.predict(X_test)
-    y_pred = (raw_pred == -1).astype(int)
-    y_score = -model.decision_function(X_test)
-
+    y_pred = (model.predict(X_test) == -1).astype(int)
+    # decision_function is lower for anomalous samples; invert it to make a
+    # higher score consistently mean "more likely anomaly", as with XGBoost.
+    y_prob = -model.decision_function(X_test)
     metrics = calculate_security_metrics(
         y_test,
         y_pred,
-        y_score,
+        y_prob,
         model_name="isolation_forest",
     )
     metrics["contamination"] = contamination
+    metrics["train_samples"] = len(X_train)
+    metrics["test_samples"] = len(X_test)
 
     model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_path)
@@ -91,8 +99,11 @@ def train_isolation_model(
     print(f"Saved model to: {model_path}")
     print(f"Saved metrics to: {metrics_path}")
     print(f"Saved feature importance to: {importance_path}")
-
     return metrics
+
+
+# Alias with an explicit algorithm name for callers that prefer it.
+train_isolation_forest = train_isolation_model
 
 
 if __name__ == "__main__":
