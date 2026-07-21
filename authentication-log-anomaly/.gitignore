@@ -3,6 +3,7 @@ __pycache__/
 models/*.pkl
 results/metrics/*.csv
 data/raw/*
+data/raw/*.txt
 data/processed/*
 results/figures/*
 results/metrics/*.json
