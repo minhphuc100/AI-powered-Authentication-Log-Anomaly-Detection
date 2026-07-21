@@ -7,3 +7,6 @@ data/raw/*.txt
 data/processed/*
 results/figures/*
 results/metrics/*.json
+auth.txt
+!data/raw/.gitkeep
+!data/processed/.gitkeep
