@@ -1,26 +1,31 @@
-"""
-Improved XGBoost Model
-
-This script trains a stronger XGBoost classifier for authentication log anomaly
-detection. It adds imbalance handling, validation-based early stopping, a lower
-classification threshold, and feature-importance reporting.
-"""
-
 from __future__ import annotations
 
-import inspect
 from pathlib import Path
+import inspect
 
 import joblib
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from xgboost import XGBClassifier
 
 try:
-    from .Xgboostbaseline import FEATURE_COLUMNS, FEATURES_PATH, load_features, prepare_xy
+    from .Xgboostbaseline import (
+        FEATURE_COLUMNS,
+        TEST_PATH,
+        TRAIN_PATH,
+        VALID_PATH,
+        load_features,
+        prepare_xy,
+    )
     from .Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
 except ImportError:
-    from Xgboostbaseline import FEATURE_COLUMNS, FEATURES_PATH, load_features, prepare_xy
+    from Xgboostbaseline import (
+        FEATURE_COLUMNS,
+        TEST_PATH,
+        TRAIN_PATH,
+        VALID_PATH,
+        load_features,
+        prepare_xy,
+    )
     from Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
 
 
@@ -37,7 +42,6 @@ def _fit_with_early_stopping(
     X_val: pd.DataFrame,
     y_val: pd.Series,
 ) -> XGBClassifier:
-    """Fit with early stopping across older and newer XGBoost APIs."""
     fit_signature = inspect.signature(model.fit)
     if "early_stopping_rounds" in fit_signature.parameters:
         model.fit(
@@ -59,7 +63,6 @@ def _fit_with_early_stopping(
 
 
 def save_feature_importance(model: XGBClassifier, output_path: Path) -> pd.DataFrame:
-    """Save feature importance scores from the trained XGBoost model."""
     importance = pd.DataFrame(
         {
             "feature": FEATURE_COLUMNS,
@@ -73,39 +76,23 @@ def save_feature_importance(model: XGBClassifier, output_path: Path) -> pd.DataF
 
 
 def train_improved_model(
-    features_path: Path = FEATURES_PATH,
+    train_path: Path = TRAIN_PATH,
+    valid_path: Path = VALID_PATH,
+    test_path: Path = TEST_PATH,
     model_path: Path = MODEL_PATH,
     metrics_path: Path = METRICS_PATH,
     importance_path: Path = IMPORTANCE_PATH,
     threshold: float = 0.35,
 ) -> dict:
     """Train an improved XGBoost model for imbalanced auth-log anomalies."""
-    df = load_features(features_path)
-    X, y = prepare_xy(df)
+    X_train, y_train = prepare_xy(load_features(train_path))
+    X_val, y_val = prepare_xy(load_features(valid_path))
+    X_test, y_test = prepare_xy(load_features(test_path))
 
-    # Reserve an untouched test set, then split validation data from training.
-    X_train_full, X_test, y_train_full, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
-        stratify=y,
-        random_state=42,
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train_full,
-        y_train_full,
-        test_size=0.2,
-        stratify=y_train_full,
-        random_state=42,
-    )
-
-    # Increase the weight of anomaly examples when normal events dominate.
     n_normal = (y_train == 0).sum()
     n_anomaly = (y_train == 1).sum()
     scale_pos_weight = n_normal / max(n_anomaly, 1)
 
-    # Improved configuration: more trees, regularization, row/column sampling,
-    # and imbalance-aware positive class weighting.
     model = XGBClassifier(
         n_estimators=300,
         max_depth=5,
@@ -122,7 +109,6 @@ def train_improved_model(
 
     _fit_with_early_stopping(model, X_train, y_train, X_val, y_val)
 
-    # Lower threshold favors recall, which helps catch more suspicious logins.
     y_prob = model.predict_proba(X_test)[:, 1]
     y_pred = (y_prob >= threshold).astype(int)
     metrics = calculate_security_metrics(
@@ -134,7 +120,6 @@ def train_improved_model(
     metrics["threshold"] = threshold
     metrics["scale_pos_weight"] = scale_pos_weight
 
-    # Save the model, metrics, and ranking of influential auth-log features.
     model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_path)
     save_metrics(metrics, metrics_path)
@@ -152,3 +137,4 @@ def train_improved_model(
 
 if __name__ == "__main__":
     train_improved_model()
+
