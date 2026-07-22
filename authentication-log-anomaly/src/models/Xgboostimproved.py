@@ -1,7 +1,15 @@
+"""
+Improved XGBoost Model
+
+Trains a stronger XGBoost classifier with validation-based early stopping,
+class-imbalance handling, a lower anomaly threshold, and feature-importance
+reporting.
+"""
+
 from __future__ import annotations
 
-from pathlib import Path
 import inspect
+from pathlib import Path
 
 import joblib
 import pandas as pd
@@ -15,6 +23,7 @@ try:
         VALID_PATH,
         load_features,
         prepare_xy,
+        resolve_feature_path,
     )
     from .Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
 except ImportError:
@@ -25,6 +34,7 @@ except ImportError:
         VALID_PATH,
         load_features,
         prepare_xy,
+        resolve_feature_path,
     )
     from Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
 
@@ -42,6 +52,7 @@ def _fit_with_early_stopping(
     X_val: pd.DataFrame,
     y_val: pd.Series,
 ) -> XGBClassifier:
+    """Fit with early stopping across older and newer XGBoost versions."""
     fit_signature = inspect.signature(model.fit)
     if "early_stopping_rounds" in fit_signature.parameters:
         model.fit(
@@ -63,6 +74,7 @@ def _fit_with_early_stopping(
 
 
 def save_feature_importance(model: XGBClassifier, output_path: Path) -> pd.DataFrame:
+    """Save the XGBoost feature-importance ranking to CSV."""
     importance = pd.DataFrame(
         {
             "feature": FEATURE_COLUMNS,
@@ -85,14 +97,22 @@ def train_improved_model(
     threshold: float = 0.35,
 ) -> dict:
     """Train an improved XGBoost model for imbalanced auth-log anomalies."""
+    # Resolve paths first so errors show the actual file location being used.
+    train_path = resolve_feature_path(train_path)
+    valid_path = resolve_feature_path(valid_path)
+    test_path = resolve_feature_path(test_path)
+
     X_train, y_train = prepare_xy(load_features(train_path))
     X_val, y_val = prepare_xy(load_features(valid_path))
     X_test, y_test = prepare_xy(load_features(test_path))
 
+    # Weight anomaly examples higher when the dataset is mostly normal logins.
     n_normal = (y_train == 0).sum()
     n_anomaly = (y_train == 1).sum()
     scale_pos_weight = n_normal / max(n_anomaly, 1)
 
+    # Stronger configuration than the baseline: more trees, regularization,
+    # subsampling, and class weighting for imbalanced labels.
     model = XGBClassifier(
         n_estimators=300,
         max_depth=5,
@@ -109,6 +129,7 @@ def train_improved_model(
 
     _fit_with_early_stopping(model, X_train, y_train, X_val, y_val)
 
+    # Lower threshold favors recall, which is useful for suspicious-login alerts.
     y_prob = model.predict_proba(X_test)[:, 1]
     y_pred = (y_prob >= threshold).astype(int)
     metrics = calculate_security_metrics(
@@ -120,6 +141,7 @@ def train_improved_model(
     metrics["threshold"] = threshold
     metrics["scale_pos_weight"] = scale_pos_weight
 
+    # Persist the model, scalar metrics, and feature-importance report.
     model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_path)
     save_metrics(metrics, metrics_path)
