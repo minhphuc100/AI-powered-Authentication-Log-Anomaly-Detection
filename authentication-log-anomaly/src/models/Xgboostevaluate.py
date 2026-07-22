@@ -22,10 +22,12 @@ def select_decision_threshold(
     y_prob,
     bins: int = 10_000,
     min_recall_target: float = 0.8,
-) -> dict[str, float]:
-    """Select the validation threshold with maximum F1 using bounded memory."""
+) -> dict[str, Any]:
+    """Maximize precision subject to a validation recall target."""
     if bins < 2:
         raise ValueError("bins must be at least two")
+    if not 0.0 < min_recall_target <= 1.0:
+        raise ValueError("min_recall_target must be in (0, 1]")
 
     labels = np.asarray(y_true, dtype=np.int8)
     probabilities = np.asarray(y_prob, dtype=np.float64)
@@ -59,14 +61,23 @@ def select_decision_threshold(
         out=np.zeros_like(precision),
         where=(precision + recall) > 0,
     )
-    valid_recall_indexes = np.where(recall >= min_recall_target)[0]
-    
-    if len(valid_recall_indexes) > 0:
-        # Trong các threshold đạt Recall >= 85%, lấy cái có Precision tốt nhất
-        best = valid_recall_indexes[np.argmax(precision[valid_recall_indexes])]
+    eligible = np.flatnonzero(recall >= min_recall_target)
+    recall_target_met = eligible.size > 0
+    if recall_target_met:
+        eligible_precision = precision[eligible]
+        best_precision = eligible_precision.max()
+        precision_ties = eligible[
+            np.isclose(eligible_precision, best_precision, rtol=0.0, atol=1e-12)
+        ]
+        tie_f1 = f1[precision_ties]
+        best_f1 = tie_f1.max()
+        f1_ties = precision_ties[
+            np.isclose(tie_f1, best_f1, rtol=0.0, atol=1e-12)
+        ]
+        # Highest threshold is the conservative tie-break: fewer alerts.
+        best = int(f1_ties[-1])
     else:
-        # Nếu không đạt nổi min_recall, lấy threshold có Recall cao nhất
-        best = int(np.argmax(recall))
+        best = int(np.argmax(f1))
     return {
         "threshold": best / bins,
         "precision": float(precision[best]),
@@ -75,6 +86,9 @@ def select_decision_threshold(
         "true_positive": int(true_positive[best]),
         "false_positive": int(false_positive[best]),
         "false_negative": int(false_negative[best]),
+        "min_recall_target": float(min_recall_target),
+        "recall_target_met": bool(recall_target_met),
+        "threshold_strategy": "max_precision_at_min_recall",
     }
 
 
