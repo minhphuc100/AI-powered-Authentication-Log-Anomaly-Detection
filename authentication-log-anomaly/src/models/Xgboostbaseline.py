@@ -1,13 +1,6 @@
-"""
-XGBoost Baseline Model
-
-Trains the first supervised XGBoost classifier for authentication-log anomaly
-detection. The loader accepts both the canonical feature_builder.py output and
-the older train/valid/test split schema used by some notebooks/scripts.
-"""
-
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 
 import joblib
@@ -21,94 +14,50 @@ except ImportError:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-SPLIT_DIR = PROCESSED_DIR / "splits"
-TRAIN_PATH = PROCESSED_DIR / "train.csv"
-VALID_PATH = PROCESSED_DIR / "valid.csv"
-TEST_PATH = PROCESSED_DIR / "test.csv"
+SPLIT_DIR = PROJECT_ROOT / "data" / "processed" / "splits"
+TRAIN_PATH = SPLIT_DIR / "train.csv"
+SMOTE_TRAIN_PATH = SPLIT_DIR / "train_smote.csv"
+VALID_PATH = SPLIT_DIR / "valid.csv"
+TEST_PATH = SPLIT_DIR / "test.csv"
 MODEL_PATH = PROJECT_ROOT / "models" / "xgboost_baseline.pkl"
 METRICS_PATH = PROJECT_ROOT / "results" / "metrics" / "xgboost_baseline_metrics.csv"
 
-# Canonical feature names shared with feature_builder.py and the deployment app.
+# The current three-day split cannot learn day_of_week or is_business_hours:
+# both are constant in train. timestamp and is_synthetic are audit columns only.
 FEATURE_COLUMNS = [
-    "auth_attempts_5m_per_user",
-    "unique_src_computers_1h_per_user",
-    "unique_users_1h_per_src_computer",
-    "unique_dst_computers_1h_per_user",
-    "unique_dst_users_1h_per_src_computer",
+    "failed_logins_5m_user",
+    "unique_src_ip_1h",
+    "failed_logins_5m_ip",
+    "failure_rate_1h",
+    "unique_users_1h_per_ip",
     "hour_of_day",
     "is_network_logon",
 ]
 
-# Older split files use different names. These aliases let the model train on
-# either CSV layout without throwing "usecols do not match columns" errors.
-FEATURE_ALIASES = {
-    "auth_attempts_5m_per_user": "failed_logins_5m_user",
-    "unique_src_computers_1h_per_user": "unique_src_ip_1h",
-    "unique_users_1h_per_src_computer": "unique_users_1h_per_ip",
-}
-
-
-def resolve_feature_path(path: Path) -> Path:
-    """Find a split file in the current or legacy processed-data locations."""
-    if path.exists():
-        return path
-
-    legacy_path = SPLIT_DIR / path.name
-    if legacy_path.exists():
-        return legacy_path
-
-    processed_path = PROCESSED_DIR / path.name
-    if processed_path.exists():
-        return processed_path
-
-    raise FileNotFoundError(
-        f"Feature split not found: {path}. Run parser.py and feature_builder.py first."
-    )
+FEATURE_DTYPES = {column: "float32" for column in FEATURE_COLUMNS}
+READ_DTYPES = {**FEATURE_DTYPES, "label": "int8"}
 
 
 def load_features(path: Path) -> pd.DataFrame:
-    """Load features and normalize any known legacy column names."""
-    path = resolve_feature_path(path)
-    header = pd.read_csv(path, nrows=0)
-    available_columns = set(header.columns)
-
-    usecols = ["label"]
-    missing_columns: list[str] = []
-    for column in FEATURE_COLUMNS:
-        alias = FEATURE_ALIASES.get(column)
-        if column in available_columns:
-            usecols.append(column)
-        elif alias in available_columns:
-            usecols.append(alias)
-        else:
-            missing_columns.append(column)
-
-    if "label" not in available_columns:
-        raise ValueError(
-            f"Label column not found in {path}. Expected a binary 'label' column."
-        )
-
-    df = pd.read_csv(path, usecols=usecols)
-    for canonical, alias in FEATURE_ALIASES.items():
-        if canonical not in df.columns and alias in df.columns:
-            df = df.rename(columns={alias: canonical})
-
-    for column in missing_columns:
-        print(f"[xgboost] Warning: {path.name} is missing '{column}', filling with 0.")
-        df[column] = 0
-
-    return df[FEATURE_COLUMNS + ["label"]]
+    if not path.exists():
+        raise FileNotFoundError(f"Feature split not found: {path}")
+    header = pd.read_csv(path, nrows=0).columns.tolist()
+    missing = [column for column in FEATURE_COLUMNS + ["label"] if column not in header]
+    if missing:
+        raise ValueError(f"Missing required columns in {path}: {missing}")
+    return pd.read_csv(
+        path,
+        usecols=FEATURE_COLUMNS + ["label"],
+        dtype=READ_DTYPES,
+    )
 
 
 def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    """Split a normalized feature table into model inputs and labels."""
-    missing = [col for col in FEATURE_COLUMNS + ["label"] if col not in df.columns]
+    missing = [column for column in FEATURE_COLUMNS + ["label"] if column not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-
-    X = df[FEATURE_COLUMNS].fillna(0)
-    y = df["label"].astype(int)
+    X = df[FEATURE_COLUMNS].fillna(0.0).astype("float32", copy=False)
+    y = df["label"].fillna(0).astype("int8", copy=False)
     return X, y
 
 
@@ -118,44 +67,51 @@ def train_baseline_model(
     model_path: Path = MODEL_PATH,
     metrics_path: Path = METRICS_PATH,
 ) -> dict:
-    """Train on the chronological train split and evaluate once on test."""
-    # The split files may be in data/processed or data/processed/splits.
-    X_train, y_train = prepare_xy(load_features(train_path))
-    X_test, y_test = prepare_xy(load_features(test_path))
-
-    # Conservative baseline: shallow trees and a moderate learning rate.
+    """Train an unweighted chronological baseline and evaluate at threshold 0.5."""
+    train_df = load_features(train_path)
+    X_train, y_train = prepare_xy(train_df)
     model = XGBClassifier(
         n_estimators=100,
         max_depth=3,
         learning_rate=0.1,
         objective="binary:logistic",
-        eval_metric="logloss",
+        eval_metric="aucpr",
+        tree_method="hist",
+        max_bin=256,
+        n_jobs=-1,
         random_state=42,
     )
-
     model.fit(X_train, y_train)
+    del train_df, X_train, y_train
+    gc.collect()
 
-    # Use both class predictions and probabilities for model-quality metrics.
-    y_pred = model.predict(X_test)
+    test_df = load_features(test_path)
+    X_test, y_test = prepare_xy(test_df)
     y_prob = model.predict_proba(X_test)[:, 1]
+    y_pred = (y_prob >= 0.5).astype("int8")
     metrics = calculate_security_metrics(
         y_test,
         y_pred,
         y_prob,
-        model_name="xgboost_baseline",
+        model_name="xgboost_baseline_unweighted",
     )
+    metrics["threshold"] = 0.5
+    metrics["train_source"] = train_path.name
 
-    # Save the trained model and metrics so they can be inspected later.
+    bundle = {
+        "model": model,
+        "feature_columns": FEATURE_COLUMNS,
+        "threshold": 0.5,
+        "train_source": train_path.name,
+    }
     model_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, model_path)
+    joblib.dump(bundle, model_path)
     save_metrics(metrics, metrics_path)
     print_metrics(metrics)
-    print(f"Saved model to: {model_path}")
+    print(f"Saved model bundle to: {model_path}")
     print(f"Saved metrics to: {metrics_path}")
-
     return metrics
 
 
 if __name__ == "__main__":
     train_baseline_model()
-
