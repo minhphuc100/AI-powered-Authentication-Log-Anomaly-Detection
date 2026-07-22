@@ -72,6 +72,18 @@ except ImportError:
             "is_network_logon",
         ]
 
+LEGACY_FEATURE_COLUMNS = [
+    "failed_logins_5m_user",
+    "unique_src_ip_1h",
+    "failed_logins_5m_ip",
+    "failure_rate_1h",
+    "unique_users_1h_per_ip",
+    "hour_of_day",
+    "day_of_week",
+    "is_business_hours",
+    "is_network_logon",
+]
+
 
 APP_NAME = "Authentication Log Anomaly Desktop App"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -244,6 +256,10 @@ class WindowDistinctCounter:
 class RealtimeFeatureEngine:
     def __init__(self) -> None:
         self.attempts_5m_by_user = WindowCounter(FIVE_MINUTES)
+        self.failed_attempts_5m_by_user = WindowCounter(FIVE_MINUTES)
+        self.failed_attempts_5m_by_src_host = WindowCounter(FIVE_MINUTES)
+        self.attempts_1h_by_user = WindowCounter(ONE_HOUR)
+        self.failed_attempts_1h_by_user = WindowCounter(ONE_HOUR)
         self.src_computers_1h_by_user = WindowDistinctCounter(ONE_HOUR)
         self.users_1h_by_src_computer = WindowDistinctCounter(ONE_HOUR)
         self.dst_computers_1h_by_user = WindowDistinctCounter(ONE_HOUR)
@@ -258,6 +274,10 @@ class RealtimeFeatureEngine:
 
         for window in (
             self.attempts_5m_by_user,
+            self.failed_attempts_5m_by_user,
+            self.failed_attempts_5m_by_src_host,
+            self.attempts_1h_by_user,
+            self.failed_attempts_1h_by_user,
             self.src_computers_1h_by_user,
             self.users_1h_by_src_computer,
             self.dst_computers_1h_by_user,
@@ -266,6 +286,11 @@ class RealtimeFeatureEngine:
             window.expire(current_time)
 
         hour_of_day = float((current_time % SECONDS_PER_DAY) // 3_600)
+        day_of_week = float(datetime.fromtimestamp(current_time).weekday())
+        attempts_1h = self.attempts_1h_by_user.get(event.src_username)
+        failed_1h = self.failed_attempts_1h_by_user.get(event.src_username)
+        failure_rate_1h = float(failed_1h / attempts_1h) if attempts_1h else 0.0
+
         features = {
             "auth_attempts_5m_per_user": float(self.attempts_5m_by_user.get(event.src_username)),
             "unique_src_computers_1h_per_user": float(self.src_computers_1h_by_user.nunique(event.src_username)),
@@ -275,9 +300,22 @@ class RealtimeFeatureEngine:
             "hour_of_day": hour_of_day,
             "is_network_logon": float(int(str(event.logon_type) in {"Network", "3", "8", "10"})),
             "current_result_is_fail": float(int(event.result == "Fail")),
+            # Compatibility with older XGBoost models trained on split CSVs.
+            "failed_logins_5m_user": float(self.failed_attempts_5m_by_user.get(event.src_username)),
+            "unique_src_ip_1h": float(self.src_computers_1h_by_user.nunique(event.src_username)),
+            "failed_logins_5m_ip": float(self.failed_attempts_5m_by_src_host.get(event.src_host)),
+            "failure_rate_1h": failure_rate_1h,
+            "unique_users_1h_per_ip": float(self.users_1h_by_src_computer.nunique(event.src_host)),
+            "day_of_week": day_of_week,
+            "is_business_hours": float(int(9 <= hour_of_day < 17)),
         }
 
         self.attempts_5m_by_user.add(current_time, event.src_username)
+        self.attempts_1h_by_user.add(current_time, event.src_username)
+        if event.result == "Fail":
+            self.failed_attempts_5m_by_user.add(current_time, event.src_username)
+            self.failed_attempts_5m_by_src_host.add(current_time, event.src_host)
+            self.failed_attempts_1h_by_user.add(current_time, event.src_username)
         self.src_computers_1h_by_user.add(current_time, event.src_username, event.src_host)
         self.users_1h_by_src_computer.add(current_time, event.src_host, event.username)
         self.dst_computers_1h_by_user.add(current_time, event.src_username, event.destination_host)
@@ -290,6 +328,7 @@ class InferenceEngine:
         self.model = None
         self.model_path: Path | None = None
         self.model_name = "Heuristic fallback"
+        self.feature_columns = list(FEATURE_COLUMNS)
         self.threshold = DEFAULT_THRESHOLD
 
     def set_threshold(self, value: float) -> None:
@@ -312,11 +351,13 @@ class InferenceEngine:
         self.model = joblib.load(model_path)
         self.model_path = model_path
         self.model_name = model_path.stem
+        self.feature_columns = self._detect_model_features(self.model)
 
     def unload_model(self) -> None:
         self.model = None
         self.model_path = None
         self.model_name = "Heuristic fallback"
+        self.feature_columns = list(FEATURE_COLUMNS)
 
     def import_model(self, source_path: Path) -> Path:
         ensure_runtime_dirs()
@@ -334,7 +375,7 @@ class InferenceEngine:
             self.unload_model()
 
     def score(self, event: NormalizedEvent, features: dict[str, float]) -> DetectionResult:
-        prepared = {column: float(features.get(column, 0.0)) for column in FEATURE_COLUMNS}
+        prepared = {column: float(features.get(column, 0.0)) for column in self.feature_columns}
         if self.model is None:
             anomaly_score = self._heuristic_score(event, features)
             raw_score = anomaly_score
@@ -360,7 +401,7 @@ class InferenceEngine:
         if self.model is None:
             return 0.0, 0.0, False
 
-        frame = pd.DataFrame([prepared], columns=FEATURE_COLUMNS)
+        frame = pd.DataFrame([prepared], columns=self.feature_columns)
         if hasattr(self.model, "predict_proba"):
             proba = float(self.model.predict_proba(frame)[0][1])
             return proba, proba, proba >= self.threshold
@@ -377,6 +418,22 @@ class InferenceEngine:
             return prediction, prediction, prediction >= self.threshold
 
         raise TypeError("Model không hỗ trợ `predict_proba`, `decision_function` hoặc `predict`.")
+
+    def _detect_model_features(self, model) -> list[str]:
+        """Use the loaded model's expected feature order when available."""
+        feature_names = getattr(model, "feature_names_in_", None)
+        if feature_names is not None:
+            return [str(column) for column in feature_names]
+
+        if hasattr(model, "get_booster"):
+            booster_features = model.get_booster().feature_names
+            if booster_features:
+                return [str(column) for column in booster_features]
+
+        feature_count = getattr(model, "n_features_in_", None)
+        if feature_count == len(LEGACY_FEATURE_COLUMNS):
+            return list(LEGACY_FEATURE_COLUMNS)
+        return list(FEATURE_COLUMNS)
 
     def _heuristic_score(self, event: NormalizedEvent, features: dict[str, float]) -> float:
         attempts = min(features["auth_attempts_5m_per_user"] / 8.0, 1.0)
