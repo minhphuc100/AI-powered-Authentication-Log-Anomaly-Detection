@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
+    classification_report,
     confusion_matrix,
     f1_score,
     precision_score,
@@ -15,263 +17,136 @@ from sklearn.metrics import (
 )
 
 
-# ============================================================
-# CALCULATE SECURITY METRICS
-# ============================================================
-
 def calculate_security_metrics(
     y_true,
     y_pred,
-    y_prob,
-    model_name="model",
-):
+    y_prob=None,
+    model_name: str = "model",
+) -> dict[str, Any]:
+    """
+    Return metrics used to compare anomaly detection models.
 
-    # --------------------------------------------------------
-    # Basic classification metrics
-    # --------------------------------------------------------
+    PR-AUC is included because the dataset is extremely
+    imbalanced and the anomaly class is very rare.
+    """
 
-    accuracy = accuracy_score(
-        y_true,
-        y_pred,
-    )
+    metrics: dict[str, Any] = {
 
-    precision = precision_score(
-        y_true,
-        y_pred,
-        zero_division=0,
-    )
+        "model":
+            model_name,
 
-    recall = recall_score(
-        y_true,
-        y_pred,
-        zero_division=0,
-    )
+        "accuracy":
+            accuracy_score(
+                y_true,
+                y_pred,
+            ),
 
-    f1 = f1_score(
-        y_true,
-        y_pred,
-        zero_division=0,
-    )
+        "precision":
+            precision_score(
+                y_true,
+                y_pred,
+                zero_division=0,
+            ),
 
-    # --------------------------------------------------------
-    # ROC-AUC
-    # --------------------------------------------------------
+        "recall":
+            recall_score(
+                y_true,
+                y_pred,
+                zero_division=0,
+            ),
 
-    try:
+        "f1":
+            f1_score(
+                y_true,
+                y_pred,
+                zero_division=0,
+            ),
 
-        roc_auc = roc_auc_score(
-            y_true,
-            y_prob,
-        )
+        "confusion_matrix":
+            confusion_matrix(
+                y_true,
+                y_pred,
+            ).tolist(),
 
-    except ValueError:
+        "classification_report":
+            classification_report(
 
-        roc_auc = float(
-            "nan"
-        )
+                y_true,
 
-    # --------------------------------------------------------
-    # PR-AUC
-    #
-    # More useful for highly imbalanced
-    # anomaly detection problems.
-    # --------------------------------------------------------
+                y_pred,
 
-    try:
+                target_names=[
+                    "normal",
+                    "anomaly",
+                ],
 
-        pr_auc = average_precision_score(
-            y_true,
-            y_prob,
-        )
-
-    except ValueError:
-
-        pr_auc = float(
-            "nan"
-        )
-
-    # --------------------------------------------------------
-    # Confusion matrix
-    # --------------------------------------------------------
-
-    cm = confusion_matrix(
-        y_true,
-        y_pred,
-        labels=[
-            0,
-            1,
-        ],
-    )
-
-    tn, fp, fn, tp = (
-        cm.ravel()
-    )
-
-    # --------------------------------------------------------
-    # False Positive Rate
-    # --------------------------------------------------------
-
-    false_positive_rate = (
-        fp
-        / max(
-            fp + tn,
-            1,
-        )
-    )
-
-    # --------------------------------------------------------
-    # False Negative Rate
-    # --------------------------------------------------------
-
-    false_negative_rate = (
-        fn
-        / max(
-            fn + tp,
-            1,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Return metrics
-    # --------------------------------------------------------
-
-    return {
-
-        "model": model_name,
-
-        "accuracy": accuracy,
-
-        "precision": precision,
-
-        "recall": recall,
-
-        "f1": f1,
-
-        "roc_auc": roc_auc,
-
-        "pr_auc": pr_auc,
-
-        "true_negative": int(
-            tn
-        ),
-
-        "false_positive": int(
-            fp
-        ),
-
-        "false_negative": int(
-            fn
-        ),
-
-        "true_positive": int(
-            tp
-        ),
-
-        "false_positive_rate":
-            false_positive_rate,
-
-        "false_negative_rate":
-            false_negative_rate,
+                zero_division=0,
+            ),
     }
 
+    # ========================================================
+    # ROC-AUC
+    # ========================================================
 
-# ============================================================
-# PRINT METRICS
-# ============================================================
+    if (
+        y_prob is not None
+        and len(
+            set(y_true)
+        ) > 1
+    ):
 
-def print_metrics(
-    metrics: dict,
-):
+        metrics[
+            "roc_auc"
+        ] = roc_auc_score(
 
-    print(
-        "\n"
-        + "=" * 60
-    )
+            y_true,
 
-    print(
-        "MODEL EVALUATION RESULTS"
-    )
+            y_prob,
 
-    print(
-        "=" * 60
-    )
+        )
 
-    print(
-        f"Model: "
-        f"{metrics.get('model', 'N/A')}"
-    )
+    else:
 
-    print(
-        f"Accuracy: "
-        f"{metrics['accuracy']:.6f}"
-    )
+        metrics[
+            "roc_auc"
+        ] = None
 
-    print(
-        f"Precision: "
-        f"{metrics['precision']:.6f}"
-    )
+    # ========================================================
+    # PR-AUC
+    #
+    # Especially useful for your dataset because:
+    #
+    # Train attacks:      523
+    # Validation attacks: 126
+    # Test attacks:       53
+    #
+    # The positive class is extremely rare.
+    # ========================================================
 
-    print(
-        f"Recall: "
-        f"{metrics['recall']:.6f}"
-    )
+    if (
+        y_prob is not None
+        and len(
+            set(y_true)
+        ) > 1
+    ):
 
-    print(
-        f"F1 Score: "
-        f"{metrics['f1']:.6f}"
-    )
+        metrics[
+            "pr_auc"
+        ] = average_precision_score(
 
-    print(
-        f"ROC-AUC: "
-        f"{metrics['roc_auc']:.6f}"
-    )
+            y_true,
 
-    print(
-        f"PR-AUC: "
-        f"{metrics['pr_auc']:.6f}"
-    )
+            y_prob,
 
-    print(
-        "\nConfusion Matrix:"
-    )
+        )
 
-    print(
-        f"True Negative: "
-        f"{metrics['true_negative']:,}"
-    )
+    else:
 
-    print(
-        f"False Positive: "
-        f"{metrics['false_positive']:,}"
-    )
+        metrics[
+            "pr_auc"
+        ] = None
 
-    print(
-        f"False Negative: "
-        f"{metrics['false_negative']:,}"
-    )
-
-    print(
-        f"True Positive: "
-        f"{metrics['true_positive']:,}"
-    )
-
-    print(
-        "\nError Rates:"
-    )
-
-    print(
-        f"False Positive Rate: "
-        f"{metrics['false_positive_rate']:.6f}"
-    )
-
-    print(
-        f"False Negative Rate: "
-        f"{metrics['false_negative_rate']:.6f}"
-    )
-
-    print(
-        "=" * 60
-    )
+    return metrics
 
 
 # ============================================================
@@ -279,63 +154,73 @@ def print_metrics(
 # ============================================================
 
 def save_metrics(
-    metrics: dict,
+    metrics: dict[str, Any],
     output_path: Path,
-):
-
-    output_path = Path(
-        output_path
-    )
+) -> None:
 
     output_path.parent.mkdir(
+
         parents=True,
+
         exist_ok=True,
+
     )
 
-    # Convert dictionary to
-    # one-row DataFrame.
+    flat_metrics = {
 
-    df = pd.DataFrame(
-        [metrics]
-    )
+        key: value
 
-    # If the file already exists,
-    # append the new result.
+        for key, value in metrics.items()
 
-    if output_path.exists():
+        if key
+        not in {
+            "classification_report",
+            "confusion_matrix",
+        }
 
-        df.to_csv(
-            output_path,
-            mode="a",
-            header=False,
-            index=False,
-        )
+    }
 
-    else:
+    pd.DataFrame(
+        [flat_metrics]
+    ).to_csv(
 
-        df.to_csv(
-            output_path,
-            index=False,
-        )
+        output_path,
 
-    print(
-        f"\nMetrics saved to:"
-        f"\n{output_path}"
+        index=False,
+
     )
 
 
 # ============================================================
-# MAIN
+# PRINT METRICS
 # ============================================================
 
-if __name__ == "__main__":
+def print_metrics(
+    metrics: dict[str, Any],
+) -> None:
 
     print(
-        "XGBoost evaluation module."
+        f"\n[{metrics['model']}] "
+        "Classification report"
     )
 
     print(
-        "Run Xgboostbaseline.py or "
-        "Xgboostimproved.py to train "
-        "and evaluate a model."
+        metrics[
+            "classification_report"
+        ]
+    )
+
+    print(
+        f"ROC-AUC: "
+        f"{metrics['roc_auc']}"
+    )
+
+    print(
+        f"PR-AUC: "
+        f"{metrics['pr_auc']}"
+    )
+
+    print(
+        "Confusion matrix: "
+        f"{metrics['confusion_matrix']}"
     )

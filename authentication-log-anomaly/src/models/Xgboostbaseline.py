@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
 import joblib
@@ -21,7 +23,7 @@ except ImportError:
 
 
 # ============================================================
-# PATHS
+# PROJECT PATHS
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -55,6 +57,43 @@ METRICS_PATH = (
 
 
 # ============================================================
+# RESOURCE CONTROL
+# ============================================================
+
+# Number of rows loaded into RAM at once.
+#
+# Your dataset contains:
+#   Train:      ~55.9 million rows
+#   Validation: ~16.1 million rows
+#   Test:       ~44.4 million rows
+#
+# Start with 100,000.
+#
+# If your PC is stable, you can try 250,000 or 500,000.
+CHUNK_SIZE = 100_000
+
+
+# Number of CPU threads XGBoost is allowed to use.
+#
+# Your machine has 16 GB RAM.
+# Start with 2 to reduce CPU/RAM pressure.
+#
+# You can increase this to 4 if training is stable.
+N_JOBS = 2
+
+
+# Small pause between training chunks.
+#
+# This does not make training faster.
+# It gives the system a little breathing room.
+CHUNK_SLEEP_SECONDS = 0.2
+
+
+# Lower process priority on Windows.
+LOWER_PROCESS_PRIORITY = True
+
+
+# ============================================================
 # FEATURES
 # ============================================================
 
@@ -68,69 +107,388 @@ FEATURE_COLUMNS = [
 
 
 # ============================================================
-# DATA LOADING
+# LOWER CPU PROCESS PRIORITY
 # ============================================================
 
-def load_features(path: Path) -> pd.DataFrame:
+def lower_process_priority() -> None:
     """
-    Load a processed feature file.
+    Lower the priority of the current process.
+
+    Windows:
+        BELOW_NORMAL_PRIORITY_CLASS
+
+    Linux/macOS:
+        Uses nice value when possible.
+
+    This helps prevent the training process from
+    taking all available CPU resources.
     """
 
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Feature file not found: {path}"
+    try:
+
+        if os.name == "nt":
+
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+
+            handle = kernel32.GetCurrentProcess()
+
+            BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+
+            result = kernel32.SetPriorityClass(
+                handle,
+                BELOW_NORMAL_PRIORITY_CLASS,
+            )
+
+            if result:
+
+                print(
+                    "Process priority set to "
+                    "BELOW_NORMAL."
+                )
+
+            else:
+
+                print(
+                    "Warning: Could not lower "
+                    "Windows process priority."
+                )
+
+        else:
+
+            try:
+
+                os.nice(5)
+
+                print(
+                    "Process priority lowered "
+                    "using nice()."
+                )
+
+            except PermissionError:
+
+                print(
+                    "Warning: Could not change "
+                    "process priority."
+                )
+
+    except Exception as exc:
+
+        print(
+            "Warning: Failed to change "
+            f"process priority: {exc}"
         )
 
-    print(f"Loading: {path}")
 
-    df = pd.read_csv(path)
+# ============================================================
+# CHECK DATA FILE
+# ============================================================
 
-    print(
-        f"Loaded {len(df):,} rows "
-        f"and {len(df.columns)} columns"
-    )
+def check_feature_file(
+    path: Path,
+) -> None:
 
-    return df
+    if not path.exists():
+
+        raise FileNotFoundError(
+            f"Feature file not found: {path}\n"
+            "Please check your feature-builder "
+            "output path."
+        )
 
 
 # ============================================================
-# PREPARE X AND Y
+# VALIDATE COLUMNS
 # ============================================================
 
-def prepare_xy(
+def validate_columns(
     df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.Series]:
+) -> None:
 
     required_columns = (
         FEATURE_COLUMNS
         + ["label"]
     )
 
-    missing_columns = [
-        column
-        for column in required_columns
-        if column not in df.columns
+    missing = [
+        col
+        for col in required_columns
+        if col not in df.columns
     ]
 
-    if missing_columns:
+    if missing:
+
         raise ValueError(
             "Missing required columns: "
-            f"{missing_columns}"
+            f"{missing}"
         )
 
-    X = df[
-        FEATURE_COLUMNS
-    ].copy()
 
-    y = df[
-        "label"
-    ].astype(int)
+# ============================================================
+# TRAIN ONE CHUNK
+# ============================================================
 
-    # Replace missing numerical values
-    # with zero.
-    X = X.fillna(0)
+def train_chunked_model(
+    model: XGBClassifier,
+    path: Path,
+) -> XGBClassifier:
+    """
+    Train XGBoost incrementally using CSV chunks.
 
-    return X, y
+    Each chunk is loaded into RAM, used for training,
+    then released before the next chunk is loaded.
+    """
+
+    print(
+        f"\nStarting chunked training:"
+        f"\n{path}"
+    )
+
+    first_chunk = True
+
+    total_rows = 0
+
+    total_anomalies = 0
+
+    chunk_number = 0
+
+    for chunk in pd.read_csv(
+        path,
+        chunksize=CHUNK_SIZE,
+        low_memory=True,
+    ):
+
+        chunk_number += 1
+
+        # ----------------------------------------------------
+        # Validate columns on first chunk
+        # ----------------------------------------------------
+
+        if first_chunk:
+
+            validate_columns(
+                chunk
+            )
+
+        # ----------------------------------------------------
+        # Prepare X and y
+        # ----------------------------------------------------
+
+        X_chunk = (
+            chunk[
+                FEATURE_COLUMNS
+            ]
+            .fillna(0)
+        )
+
+        y_chunk = (
+            chunk["label"]
+            .astype(int)
+        )
+
+        # ----------------------------------------------------
+        # Statistics
+        # ----------------------------------------------------
+
+        rows = len(
+            chunk
+        )
+
+        anomalies = int(
+            y_chunk.sum()
+        )
+
+        total_rows += rows
+
+        total_anomalies += anomalies
+
+        print(
+            f"\nChunk {chunk_number}"
+        )
+
+        print(
+            f"Rows: "
+            f"{rows:,}"
+        )
+
+        print(
+            f"Anomalies: "
+            f"{anomalies:,}"
+        )
+
+        print(
+            f"Total processed: "
+            f"{total_rows:,}"
+        )
+
+        # ----------------------------------------------------
+        # Train model
+        # ----------------------------------------------------
+
+        if first_chunk:
+
+            model.fit(
+                X_chunk,
+                y_chunk,
+                verbose=False,
+            )
+
+            first_chunk = False
+
+        else:
+
+            model.fit(
+                X_chunk,
+                y_chunk,
+                xgb_model=model.get_booster(),
+                verbose=False,
+            )
+
+        # ----------------------------------------------------
+        # Release chunk memory
+        # ----------------------------------------------------
+
+        del X_chunk
+
+        del y_chunk
+
+        del chunk
+
+        # ----------------------------------------------------
+        # Give system a small break
+        # ----------------------------------------------------
+
+        time.sleep(
+            CHUNK_SLEEP_SECONDS
+        )
+
+    print(
+        "\nChunked training complete."
+    )
+
+    print(
+        f"Total rows processed: "
+        f"{total_rows:,}"
+    )
+
+    print(
+        f"Total anomalies: "
+        f"{total_anomalies:,}"
+    )
+
+    return model
+
+
+# ============================================================
+# EVALUATE TEST SET IN CHUNKS
+# ============================================================
+
+def predict_test_in_chunks(
+    model: XGBClassifier,
+    path: Path,
+):
+    """
+    Predict the test set chunk by chunk.
+
+    This prevents loading the entire test dataset
+    into memory.
+    """
+
+    all_predictions = []
+
+    all_probabilities = []
+
+    all_labels = []
+
+    total_rows = 0
+
+    chunk_number = 0
+
+    print(
+        f"\nEvaluating test data:"
+        f"\n{path}"
+    )
+
+    for chunk in pd.read_csv(
+        path,
+        chunksize=CHUNK_SIZE,
+        low_memory=True,
+    ):
+
+        chunk_number += 1
+
+        validate_columns(
+            chunk
+        )
+
+        X_chunk = (
+            chunk[
+                FEATURE_COLUMNS
+            ]
+            .fillna(0)
+        )
+
+        y_chunk = (
+            chunk["label"]
+            .astype(int)
+        )
+
+        # ----------------------------------------------------
+        # Prediction
+        # ----------------------------------------------------
+
+        y_prob_chunk = (
+            model.predict_proba(
+                X_chunk
+            )[:, 1]
+        )
+
+        y_pred_chunk = (
+            y_prob_chunk >= 0.5
+        ).astype(int)
+
+        # ----------------------------------------------------
+        # Store results
+        # ----------------------------------------------------
+
+        all_labels.extend(
+            y_chunk.tolist()
+        )
+
+        all_predictions.extend(
+            y_pred_chunk.tolist()
+        )
+
+        all_probabilities.extend(
+            y_prob_chunk.tolist()
+        )
+
+        total_rows += len(
+            chunk
+        )
+
+        print(
+            f"Test chunk "
+            f"{chunk_number}: "
+            f"{total_rows:,} rows processed"
+        )
+
+        del X_chunk
+
+        del y_chunk
+
+        del chunk
+
+        time.sleep(
+            CHUNK_SLEEP_SECONDS
+        )
+
+    return (
+        all_labels,
+        all_predictions,
+        all_probabilities,
+    )
 
 
 # ============================================================
@@ -145,139 +503,84 @@ def train_baseline_model(
 ) -> dict:
 
     # --------------------------------------------------------
-    # Load pre-split datasets
+    # Lower process priority
     # --------------------------------------------------------
 
-    train_df = load_features(
+    if LOWER_PROCESS_PRIORITY:
+
+        lower_process_priority()
+
+    # --------------------------------------------------------
+    # Check paths
+    # --------------------------------------------------------
+
+    check_feature_file(
         train_path
     )
 
-    test_df = load_features(
+    check_feature_file(
         test_path
     )
 
     # --------------------------------------------------------
-    # Prepare training data
-    # --------------------------------------------------------
-
-    X_train, y_train = prepare_xy(
-        train_df
-    )
-
-    # --------------------------------------------------------
-    # Prepare test data
-    # --------------------------------------------------------
-
-    X_test, y_test = prepare_xy(
-        test_df
-    )
-
-    print(
-        f"\nTraining rows: {len(X_train):,}"
-    )
-
-    print(
-        f"Test rows: {len(X_test):,}"
-    )
-
-    print(
-        f"Training attacks: "
-        f"{int(y_train.sum()):,}"
-    )
-
-    print(
-        f"Test attacks: "
-        f"{int(y_test.sum()):,}"
-    )
-
-    # --------------------------------------------------------
-    # Calculate class imbalance
-    # --------------------------------------------------------
-
-    n_normal = (
-        y_train == 0
-    ).sum()
-
-    n_anomaly = (
-        y_train == 1
-    ).sum()
-
-    scale_pos_weight = (
-        n_normal
-        / max(n_anomaly, 1)
-    )
-
-    print(
-        f"\nNormal samples: "
-        f"{n_normal:,}"
-    )
-
-    print(
-        f"Anomaly samples: "
-        f"{n_anomaly:,}"
-    )
-
-    print(
-        f"scale_pos_weight: "
-        f"{scale_pos_weight:.2f}"
-    )
-
-    # --------------------------------------------------------
-    # Create baseline XGBoost model
+    # Create model
     # --------------------------------------------------------
 
     model = XGBClassifier(
+
         n_estimators=100,
+
         max_depth=3,
+
         learning_rate=0.1,
 
-        subsample=0.8,
-        colsample_bytree=0.8,
-
-        scale_pos_weight=scale_pos_weight,
-
         objective="binary:logistic",
+
         eval_metric="logloss",
 
         random_state=42,
 
-        n_jobs=-1,
+        n_jobs=N_JOBS,
+
     )
 
     # --------------------------------------------------------
-    # Train
+    # Train in chunks
     # --------------------------------------------------------
 
-    print(
-        "\nTraining baseline XGBoost..."
-    )
-
-    model.fit(
-        X_train,
-        y_train,
+    model = train_chunked_model(
+        model,
+        train_path,
     )
 
     # --------------------------------------------------------
-    # Predict
+    # Test in chunks
     # --------------------------------------------------------
 
-    y_pred = model.predict(
-        X_test
+    (
+        y_test,
+        y_pred,
+        y_prob,
+    ) = predict_test_in_chunks(
+        model,
+        test_path,
     )
-
-    y_prob = model.predict_proba(
-        X_test
-    )[:, 1]
 
     # --------------------------------------------------------
     # Evaluate
     # --------------------------------------------------------
 
     metrics = calculate_security_metrics(
+
         y_test,
+
         y_pred,
+
         y_prob,
-        model_name="xgboost_baseline",
+
+        model_name=(
+            "xgboost_baseline"
+        ),
     )
 
     # --------------------------------------------------------
@@ -304,7 +607,7 @@ def train_baseline_model(
     )
 
     # --------------------------------------------------------
-    # Print metrics
+    # Print results
     # --------------------------------------------------------
 
     print_metrics(
@@ -312,12 +615,12 @@ def train_baseline_model(
     )
 
     print(
-        f"\nModel saved to:"
+        f"\nSaved model to:"
         f"\n{model_path}"
     )
 
     print(
-        f"\nMetrics saved to:"
+        f"\nSaved metrics to:"
         f"\n{metrics_path}"
     )
 
