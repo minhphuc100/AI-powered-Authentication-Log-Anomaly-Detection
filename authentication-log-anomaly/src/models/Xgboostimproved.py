@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import numpy as np
 import argparse
 import gc
 import inspect
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
@@ -106,6 +106,7 @@ def train_improved_model(
     metrics_path: Path | None = None,
     importance_path: Path | None = None,
     threshold_bins: int = 10_000,
+    min_recall_target: float = 0.8,
 ) -> dict:
     """Train weighted XGBoost, select threshold on valid, evaluate test once."""
     train_path, model_path, metrics_path, importance_path = _resolve_paths(
@@ -123,8 +124,8 @@ def train_improved_model(
     anomaly_count = int((y_train == 1).sum())
     if anomaly_count == 0:
         raise ValueError(f"No anomaly labels found in {train_path}")
-    raw_scale = normal_count / anomaly_count
-    scale_pos_weight = np.sqrt(raw_scale)
+    raw_scale_pos_weight = normal_count / anomaly_count
+    scale_pos_weight = float(np.sqrt(raw_scale_pos_weight))
 
     model = XGBClassifier(
         n_estimators=500,
@@ -133,7 +134,7 @@ def train_improved_model(
         subsample=0.7,
         colsample_bytree=0.7,
         min_child_weight=5,
-        reg_alpha = 1.0,
+        reg_alpha=1.0,
         reg_lambda=2.0,
         scale_pos_weight=scale_pos_weight,
         objective="binary:logistic",
@@ -150,6 +151,7 @@ def train_improved_model(
         y_valid,
         valid_probability,
         bins=threshold_bins,
+        min_recall_target=min_recall_target,
     )
     threshold = threshold_summary["threshold"]
     del train_df, valid_df, X_train, y_train, X_valid, y_valid, valid_probability
@@ -172,6 +174,11 @@ def train_improved_model(
             "validation_precision": threshold_summary["precision"],
             "validation_recall": threshold_summary["recall"],
             "validation_f1": threshold_summary["f1"],
+            "validation_false_positive": threshold_summary["false_positive"],
+            "min_recall_target": min_recall_target,
+            "recall_target_met": threshold_summary["recall_target_met"],
+            "threshold_strategy": threshold_summary["threshold_strategy"],
+            "raw_scale_pos_weight": raw_scale_pos_weight,
             "scale_pos_weight": scale_pos_weight,
             "train_source": train_path.name,
             "normal_train_rows": normal_count,
@@ -185,7 +192,12 @@ def train_improved_model(
         "feature_columns": FEATURE_COLUMNS,
         "threshold": threshold,
         "train_source": train_path.name,
+        "raw_scale_pos_weight": raw_scale_pos_weight,
         "scale_pos_weight": scale_pos_weight,
+        "min_recall_target": min_recall_target,
+        "validation_recall": threshold_summary["recall"],
+        "validation_precision": threshold_summary["precision"],
+        "threshold_strategy": threshold_summary["threshold_strategy"],
     }
     model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, model_path)
@@ -212,6 +224,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--valid", type=Path, default=VALID_PATH)
     parser.add_argument("--test", type=Path, default=TEST_PATH)
     parser.add_argument("--threshold-bins", type=int, default=10_000)
+    parser.add_argument("--min-recall-target", type=float, default=0.8)
     return parser.parse_args()
 
 
@@ -222,6 +235,7 @@ def run() -> None:
         valid_path=args.valid,
         test_path=args.test,
         threshold_bins=args.threshold_bins,
+        min_recall_target=args.min_recall_target,
     )
 
 
