@@ -1,7 +1,15 @@
+"""
+Improved XGBoost Model
+
+This script trains a stronger XGBoost classifier for authentication log anomaly
+detection. It adds imbalance handling, validation-based early stopping, a lower
+classification threshold, and feature-importance reporting.
+"""
+
 from __future__ import annotations
 
-from pathlib import Path
 import inspect
+from pathlib import Path
 
 import joblib
 import pandas as pd
@@ -29,6 +37,7 @@ def _fit_with_early_stopping(
     X_val: pd.DataFrame,
     y_val: pd.Series,
 ) -> XGBClassifier:
+    """Fit with early stopping across older and newer XGBoost APIs."""
     fit_signature = inspect.signature(model.fit)
     if "early_stopping_rounds" in fit_signature.parameters:
         model.fit(
@@ -50,6 +59,7 @@ def _fit_with_early_stopping(
 
 
 def save_feature_importance(model: XGBClassifier, output_path: Path) -> pd.DataFrame:
+    """Save feature importance scores from the trained XGBoost model."""
     importance = pd.DataFrame(
         {
             "feature": FEATURE_COLUMNS,
@@ -73,6 +83,7 @@ def train_improved_model(
     df = load_features(features_path)
     X, y = prepare_xy(df)
 
+    # Reserve an untouched test set, then split validation data from training.
     X_train_full, X_test, y_train_full, y_test = train_test_split(
         X,
         y,
@@ -88,10 +99,13 @@ def train_improved_model(
         random_state=42,
     )
 
+    # Increase the weight of anomaly examples when normal events dominate.
     n_normal = (y_train == 0).sum()
     n_anomaly = (y_train == 1).sum()
     scale_pos_weight = n_normal / max(n_anomaly, 1)
 
+    # Improved configuration: more trees, regularization, row/column sampling,
+    # and imbalance-aware positive class weighting.
     model = XGBClassifier(
         n_estimators=300,
         max_depth=5,
@@ -108,6 +122,7 @@ def train_improved_model(
 
     _fit_with_early_stopping(model, X_train, y_train, X_val, y_val)
 
+    # Lower threshold favors recall, which helps catch more suspicious logins.
     y_prob = model.predict_proba(X_test)[:, 1]
     y_pred = (y_prob >= threshold).astype(int)
     metrics = calculate_security_metrics(
@@ -118,7 +133,8 @@ def train_improved_model(
     )
     metrics["threshold"] = threshold
     metrics["scale_pos_weight"] = scale_pos_weight
-# 
+
+    # Save the model, metrics, and ranking of influential auth-log features.
     model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_path)
     save_metrics(metrics, metrics_path)
