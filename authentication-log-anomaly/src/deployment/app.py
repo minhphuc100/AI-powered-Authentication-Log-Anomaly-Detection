@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -329,6 +328,7 @@ class InferenceEngine:
         self.model_path: Path | None = None
         self.model_name = "Heuristic fallback"
         self.feature_columns = list(FEATURE_COLUMNS)
+        self.saved_threshold: float | None = None
         self.threshold = DEFAULT_THRESHOLD
 
     def set_threshold(self, value: float) -> None:
@@ -348,16 +348,33 @@ class InferenceEngine:
         return result
 
     def load_model(self, model_path: Path) -> None:
-        self.model = joblib.load(model_path)
+        loaded = joblib.load(model_path)
+        if isinstance(loaded, dict) and "model" in loaded:
+            self.model = loaded["model"]
+            self.feature_columns = [
+                str(column)
+                for column in loaded.get(
+                    "feature_columns",
+                    self._detect_model_features(self.model),
+                )
+            ]
+            saved_threshold = loaded.get("threshold")
+            self.saved_threshold = float(saved_threshold) if saved_threshold is not None else None
+            if self.saved_threshold is not None:
+                self.set_threshold(self.saved_threshold)
+        else:
+            self.model = loaded
+            self.feature_columns = self._detect_model_features(self.model)
+            self.saved_threshold = None
         self.model_path = model_path
         self.model_name = model_path.stem
-        self.feature_columns = self._detect_model_features(self.model)
 
     def unload_model(self) -> None:
         self.model = None
         self.model_path = None
         self.model_name = "Heuristic fallback"
         self.feature_columns = list(FEATURE_COLUMNS)
+        self.saved_threshold = None
 
     def import_model(self, source_path: Path) -> Path:
         ensure_runtime_dirs()
@@ -369,6 +386,10 @@ class InferenceEngine:
         return target_path
 
     def delete_model(self, model_path: Path) -> None:
+        resolved_path = model_path.resolve()
+        imported_root = IMPORTED_MODELS_DIR.resolve()
+        if imported_root not in resolved_path.parents:
+            raise PermissionError("Chỉ có thể xóa model đã import từ thư mục dữ liệu ứng dụng.")
         if model_path.exists():
             model_path.unlink()
         if self.model_path and self.model_path.resolve() == model_path.resolve():
@@ -994,9 +1015,15 @@ class AuthAnomalyDesktopApp(QMainWindow):
         try:
             if selected == "Heuristic fallback":
                 self.detector.unload_model()
+                self.detector.set_threshold(float(self.threshold_spin.value()))
             else:
                 self.detector.load_model(self.model_map[selected])
-            self.detector.set_threshold(float(self.threshold_spin.value()))
+                if self.detector.saved_threshold is not None:
+                    self.threshold_spin.blockSignals(True)
+                    self.threshold_spin.setValue(self.detector.saved_threshold)
+                    self.threshold_spin.blockSignals(False)
+                else:
+                    self.detector.set_threshold(float(self.threshold_spin.value()))
             self.model_card.set_value(self.detector.model_name)
             if log_change:
                 self.log_message(f"Đã chọn model: {selected}")
