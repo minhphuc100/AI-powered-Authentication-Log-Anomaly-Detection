@@ -3,5 +3,6 @@ numpy
 scikit-learn
 xgboost
 joblib
+streamlit
 pywin32; platform_system == "Windows"
 PySide6
