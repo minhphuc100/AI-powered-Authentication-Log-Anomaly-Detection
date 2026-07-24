@@ -1,5 +1,6 @@
 from collections import Counter, defaultdict, deque
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Deque, Hashable
 
 import pandas as pd
@@ -12,6 +13,38 @@ CHUNK_SIZE = 500_000
 FIVE_MINUTES = 300
 ONE_HOUR = 3_600
 SECONDS_PER_DAY = 86_400
+MISSING_TIME_DELTA = -1
+
+FEATURE_SCHEMA_VERSION = "auth_anomaly_v2"
+FEATURE_COLUMNS = [
+    "auth_attempts_5m_per_src_user",
+    "successful_auths_5m_per_src_user",
+    "unique_src_computers_1h_per_src_user",
+    "unique_dst_computers_5m_per_src_user",
+    "unique_dst_computers_1h_per_src_user",
+    "unique_dst_users_1h_per_src_computer",
+    "unique_src_users_1h_per_dst_computer",
+    "prior_auth_count_1h_src_user_dst_computer",
+    "is_first_seen_src_user_src_computer",
+    "is_first_seen_src_user_dst_computer",
+    "is_first_seen_src_computer_dst_computer",
+    "seconds_since_last_auth_by_src_user",
+    "seconds_since_last_src_user_dst_computer",
+    "current_event_is_success",
+    "hour_of_day",
+    "is_network_logon",
+]
+OUTPUT_COLUMNS = ["timestamp", *FEATURE_COLUMNS, "label"]
+REQUIRED_PARSED_COLUMNS = [
+    "timestamp",
+    "src_username",
+    "username",
+    "src_host",
+    "destination_host",
+    "logon_type",
+    "event_id",
+    "label",
+]
 
 
 class WindowCounter:
@@ -83,6 +116,35 @@ def _is_network_logon(logon_type: object) -> int:
     return int(str(logon_type) in {"Network", "3", "8"})
 
 
+def _is_success(event_id: object) -> int:
+    if pd.isna(event_id):
+        return 0
+    try:
+        return int(float(event_id) == 4624)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _valid_key(*values: object) -> bool:
+    return all(
+        not pd.isna(value) and str(value).strip() not in {"", "?", "-"}
+        for value in values
+    )
+
+
+def _first_seen_flag(seen: set[Hashable], key: Hashable, valid: bool) -> int:
+    return int(valid and key not in seen)
+
+
+def _seconds_since(last_seen: dict[Hashable, int], key: Hashable, current_time: int, valid: bool) -> int:
+    if not valid:
+        return MISSING_TIME_DELTA
+    previous = last_seen.get(key)
+    if previous is None:
+        return MISSING_TIME_DELTA
+    return current_time - previous
+
+
 def build_features_stream(
     input_path: Path = PROCESSED_PATH,
     output_path: Path = FEATURES_PATH,
@@ -93,18 +155,36 @@ def build_features_stream(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    attempts_5m_by_user = WindowCounter(FIVE_MINUTES)
-    src_computers_1h_by_user = WindowDistinctCounter(ONE_HOUR)
-    users_1h_by_src_computer = WindowDistinctCounter(ONE_HOUR)
-    dst_computers_1h_by_user = WindowDistinctCounter(ONE_HOUR)
+    header = pd.read_csv(input_path, nrows=0).columns.tolist()
+    missing = [column for column in REQUIRED_PARSED_COLUMNS if column not in header]
+    if missing:
+        raise ValueError(f"Parsed auth log is missing required columns: {missing}")
+
+    attempts_5m_by_src_user = WindowCounter(FIVE_MINUTES)
+    successes_5m_by_src_user = WindowCounter(FIVE_MINUTES)
+    src_computers_1h_by_src_user = WindowDistinctCounter(ONE_HOUR)
+    dst_computers_5m_by_src_user = WindowDistinctCounter(FIVE_MINUTES)
+    dst_computers_1h_by_src_user = WindowDistinctCounter(ONE_HOUR)
     dst_users_1h_by_src_computer = WindowDistinctCounter(ONE_HOUR)
+    src_users_1h_by_dst_computer = WindowDistinctCounter(ONE_HOUR)
+    auth_count_1h_by_src_user_dst_computer = WindowCounter(ONE_HOUR)
+
+    seen_src_user_src_computer: set[tuple[object, object]] = set()
+    seen_src_user_dst_computer: set[tuple[object, object]] = set()
+    seen_src_computer_dst_computer: set[tuple[object, object]] = set()
+    last_auth_by_src_user: dict[object, int] = {}
+    last_auth_by_src_user_dst_computer: dict[tuple[object, object], int] = {}
 
     wrote_header = False
     total_rows = 0
     total_labels = 0
-    last_time = None
+    last_time: int | None = None
 
-    reader = pd.read_csv(input_path, chunksize=chunksize)
+    reader = pd.read_csv(
+        input_path,
+        usecols=REQUIRED_PARSED_COLUMNS,
+        chunksize=chunksize,
+    )
     for chunk_index, chunk in enumerate(reader, start=1):
         rows: list[dict[str, object]] = []
 
@@ -124,37 +204,102 @@ def build_features_stream(
             src_computer = item.get("src_host")
             dst_computer = item.get("destination_host")
             logon_type = item.get("logon_type")
+            event_id = item.get("event_id")
 
             for window in (
-                attempts_5m_by_user,
-                src_computers_1h_by_user,
-                users_1h_by_src_computer,
-                dst_computers_1h_by_user,
+                attempts_5m_by_src_user,
+                successes_5m_by_src_user,
+                src_computers_1h_by_src_user,
+                dst_computers_5m_by_src_user,
+                dst_computers_1h_by_src_user,
                 dst_users_1h_by_src_computer,
+                src_users_1h_by_dst_computer,
+                auth_count_1h_by_src_user_dst_computer,
             ):
                 window.expire(current_time)
 
             label = _as_bool_int(item.get("label"))
+            current_event_is_success = _is_success(event_id)
+
+            src_user_src_computer = (src_username, src_computer)
+            src_user_dst_computer = (src_username, dst_computer)
+            src_computer_dst_computer = (src_computer, dst_computer)
+            valid_src_user = _valid_key(src_username)
+            valid_src_user_src_computer = _valid_key(src_username, src_computer)
+            valid_src_user_dst_computer = _valid_key(src_username, dst_computer)
+            valid_src_computer_dst_computer = _valid_key(src_computer, dst_computer)
 
             feature_row = {
-                "auth_attempts_5m_per_user": attempts_5m_by_user.get(src_username),
-                "unique_src_computers_1h_per_user": src_computers_1h_by_user.nunique(src_username),
-                "unique_users_1h_per_src_computer": users_1h_by_src_computer.nunique(src_computer),
-                "unique_dst_computers_1h_per_user": dst_computers_1h_by_user.nunique(src_username),
+                "timestamp": current_time,
+                "auth_attempts_5m_per_src_user": attempts_5m_by_src_user.get(src_username),
+                "successful_auths_5m_per_src_user": successes_5m_by_src_user.get(src_username),
+                "unique_src_computers_1h_per_src_user": src_computers_1h_by_src_user.nunique(src_username),
+                "unique_dst_computers_5m_per_src_user": dst_computers_5m_by_src_user.nunique(src_username),
+                "unique_dst_computers_1h_per_src_user": dst_computers_1h_by_src_user.nunique(src_username),
                 "unique_dst_users_1h_per_src_computer": dst_users_1h_by_src_computer.nunique(src_computer),
+                "unique_src_users_1h_per_dst_computer": src_users_1h_by_dst_computer.nunique(dst_computer),
+                "prior_auth_count_1h_src_user_dst_computer": auth_count_1h_by_src_user_dst_computer.get(
+                    src_user_dst_computer
+                ),
+                "is_first_seen_src_user_src_computer": _first_seen_flag(
+                    seen_src_user_src_computer,
+                    src_user_src_computer,
+                    valid_src_user_src_computer,
+                ),
+                "is_first_seen_src_user_dst_computer": _first_seen_flag(
+                    seen_src_user_dst_computer,
+                    src_user_dst_computer,
+                    valid_src_user_dst_computer,
+                ),
+                "is_first_seen_src_computer_dst_computer": _first_seen_flag(
+                    seen_src_computer_dst_computer,
+                    src_computer_dst_computer,
+                    valid_src_computer_dst_computer,
+                ),
+                "seconds_since_last_auth_by_src_user": _seconds_since(
+                    last_auth_by_src_user,
+                    src_username,
+                    current_time,
+                    valid_src_user,
+                ),
+                "seconds_since_last_src_user_dst_computer": _seconds_since(
+                    last_auth_by_src_user_dst_computer,
+                    src_user_dst_computer,
+                    current_time,
+                    valid_src_user_dst_computer,
+                ),
+                "current_event_is_success": current_event_is_success,
                 "hour_of_day": _hour_of_day(current_time),
                 "is_network_logon": _is_network_logon(logon_type),
                 "label": label,
             }
             rows.append(feature_row)
 
-            attempts_5m_by_user.add(current_time, src_username)
-            src_computers_1h_by_user.add(current_time, src_username, src_computer)
-            users_1h_by_src_computer.add(current_time, src_computer, src_username)
-            dst_computers_1h_by_user.add(current_time, src_username, dst_computer)
+            attempts_5m_by_src_user.add(current_time, src_username)
+            if current_event_is_success:
+                successes_5m_by_src_user.add(current_time, src_username)
+            src_computers_1h_by_src_user.add(current_time, src_username, src_computer)
+            dst_computers_5m_by_src_user.add(current_time, src_username, dst_computer)
+            dst_computers_1h_by_src_user.add(current_time, src_username, dst_computer)
             dst_users_1h_by_src_computer.add(current_time, src_computer, dst_username)
+            src_users_1h_by_dst_computer.add(current_time, dst_computer, src_username)
+            if valid_src_user_dst_computer:
+                auth_count_1h_by_src_user_dst_computer.add(
+                    current_time,
+                    src_user_dst_computer,
+                )
 
-        features = pd.DataFrame(rows)
+            if valid_src_user_src_computer:
+                seen_src_user_src_computer.add(src_user_src_computer)
+            if valid_src_user_dst_computer:
+                seen_src_user_dst_computer.add(src_user_dst_computer)
+                last_auth_by_src_user_dst_computer[src_user_dst_computer] = current_time
+            if valid_src_computer_dst_computer:
+                seen_src_computer_dst_computer.add(src_computer_dst_computer)
+            if valid_src_user:
+                last_auth_by_src_user[src_username] = current_time
+
+        features = pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
         features.to_csv(output_path, mode="w" if not wrote_header else "a", header=not wrote_header, index=False)
         wrote_header = True
 
@@ -177,14 +322,13 @@ def load(path: Path = PROCESSED_PATH) -> pd.DataFrame:
 
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    temp_input = FEATURES_PATH.parent / "_tmp_parsed_for_features.csv"
-    temp_output = FEATURES_PATH.parent / "_tmp_features.csv"
-    df.to_csv(temp_input, index=False)
-    build_features_stream(temp_input, temp_output, chunksize=len(df) or 1)
-    features = pd.read_csv(temp_output)
-    temp_input.unlink(missing_ok=True)
-    temp_output.unlink(missing_ok=True)
-    return features
+    with TemporaryDirectory(prefix="auth_anomaly_features_") as temp_dir:
+        temp_root = Path(temp_dir)
+        temp_input = temp_root / "parsed.csv"
+        temp_output = temp_root / "features.csv"
+        df.to_csv(temp_input, index=False)
+        build_features_stream(temp_input, temp_output, chunksize=len(df) or 1)
+        return pd.read_csv(temp_output)
 
 
 def run() -> None:
