@@ -8,18 +8,29 @@ import pandas as pd
 from xgboost import XGBClassifier
 
 try:
-    from ..data_engineering.feature_builder import (
-        FEATURE_COLUMNS,
-        FEATURE_SCHEMA_VERSION,
-    )
     from .Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
 except ImportError:
-    from data_engineering.feature_builder import (
-        FEATURE_COLUMNS,
-        FEATURE_SCHEMA_VERSION,
-    )
+    
     from Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
-
+FEATURE_COLUMNS = [
+    "auth_attempts_5m_per_src_user",
+    "successful_auths_5m_per_src_user",
+    "unique_src_computers_1h_per_src_user",
+    "unique_dst_computers_5m_per_src_user",
+    "unique_dst_computers_1h_per_src_user",
+    "unique_dst_users_1h_per_src_computer",
+    "unique_src_users_1h_per_dst_computer",
+    "prior_auth_count_1h_src_user_dst_computer",
+    "is_first_seen_src_user_src_computer",
+    "is_first_seen_src_user_dst_computer",
+    "is_first_seen_src_computer_dst_computer",
+    "seconds_since_last_auth_by_src_user",
+    "seconds_since_last_src_user_dst_computer",
+    "current_event_is_success",
+    "hour_of_day",
+    "is_network_logon",
+]
+FEATURE_SCHEMA_VERSION = "auth_anomaly_v2"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SPLIT_DIR = PROJECT_ROOT / "data" / "processed" / "splits"
