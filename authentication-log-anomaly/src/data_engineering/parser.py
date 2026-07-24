@@ -21,8 +21,17 @@ AUTH_COLUMNS = [
 ]
 
 REDTEAM_COLUMNS = ["time", "src_user", "src_computer", "dst_computer"]
+PARSED_COLUMNS = [
+    "timestamp",
+    "src_username",
+    "username",
+    "src_host",
+    "destination_host",
+    "logon_type",
+    "event_id",
+    "label",
+]
 
-UNKNOWN_MARKERS = {"?", "-", ""}
 CHUNK_SIZE = 1_000_000
 
 
@@ -51,21 +60,18 @@ def _clean_chunk(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["time"])
     df["time"] = df["time"].astype("int64")
 
-    text_cols = [c for c in AUTH_COLUMNS if c != "time"]
+    # Only normalize fields used by the label join or the compact parsed output.
+    text_cols = [
+        "src_user",
+        "dst_user",
+        "src_computer",
+        "dst_computer",
+        "logon_type",
+        "result",
+    ]
     for col in text_cols:
         df[col] = _normalize_text(df[col])
 
-    df = df.replace({marker: pd.NA for marker in UNKNOWN_MARKERS})
-
-    df["is_success"] = (df["result"] == "Success").astype("int8")
-    df["is_fail"] = (df["result"] == "Fail").astype("int8")
-    df["is_logon"] = (df["auth_orientation"] == "LogOn").astype("int8")
-    df["is_logoff"] = (df["auth_orientation"] == "LogOff").astype("int8")
-    df["is_tgs"] = (df["auth_orientation"] == "TGS").astype("int8")
-    df["is_machine_account"] = (
-        df["src_user"].fillna("").str.contains(r"\$@", regex=True)
-    ).astype("int8")
-    df["event_type"] = df["result"].map({"Success": "Success", "Fail": "Failure"}).fillna("Unknown")
     df["event_id"] = df["result"].map({"Success": 4624, "Fail": 4625}).fillna(0).astype("int16")
 
     return df
@@ -82,31 +88,11 @@ def _to_team_format(df: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
-    columns = [
-        "timestamp",
-        "username",
-        "src_username",
-        "src_host",
-        "destination_host",
-        "event_type",
-        "event_id",
-        "auth_type",
-        "logon_type",
-        "auth_orientation",
-        "result",
-        "is_success",
-        "is_fail",
-        "is_logon",
-        "is_logoff",
-        "is_tgs",
-        "is_machine_account",
-        "label",
-    ]
-    return df[columns]
+    return df[PARSED_COLUMNS]
 
 
 def load_redteam(path: Path = REDTEAM_PATH) -> pd.DataFrame:
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
         print(f"[parser] Redteam labels not found at {_display_path(path)}; all labels will be 0")
         return pd.DataFrame(columns=REDTEAM_COLUMNS + ["label"])
 
@@ -154,32 +140,58 @@ def parse_file(
     wrote_header = False
     total_rows = 0
     total_labels = 0
-    last_time = None
+    last_time: int | None = None
 
-    for chunk_index, chunk in enumerate(iter_auth_chunks(raw_path, chunksize), start=1):
-        chunk = _clean_chunk(chunk)
+    reader = iter_auth_chunks(raw_path, chunksize)
+    try:
+        for chunk_index, chunk in enumerate(reader, start=1):
+            chunk = _clean_chunk(chunk)
 
-        if not redteam.empty:
-            chunk = chunk.merge(redteam[label_keys + ["label"]], on=label_keys, how="left")
-            chunk["label"] = chunk["label"].fillna(0).astype("int8")
-        else:
-            chunk["label"] = 0
+            if not chunk["time"].is_monotonic_increasing:
+                raise ValueError(
+                    "Raw authentication data must be sorted by timestamp within each chunk."
+                )
+            if (
+                last_time is not None
+                and not chunk.empty
+                and int(chunk["time"].iloc[0]) < last_time
+            ):
+                raise ValueError(
+                    "Raw authentication data must be globally sorted by timestamp."
+                )
 
-        if last_time is not None and not chunk.empty and chunk["time"].iloc[0] < last_time:
-            print("[parser] Warning: input is not globally sorted by time; rolling features may need sorting.")
-        if not chunk.empty:
-            last_time = int(chunk["time"].iloc[-1])
+            if not redteam.empty:
+                chunk = chunk.merge(
+                    redteam[label_keys + ["label"]],
+                    on=label_keys,
+                    how="left",
+                )
+                chunk["label"] = chunk["label"].fillna(0).astype("int8")
+            else:
+                chunk["label"] = pd.Series(0, index=chunk.index, dtype="int8")
 
-        chunk = _to_team_format(chunk)
-        chunk.to_csv(output_path, mode="w" if not wrote_header else "a", header=not wrote_header, index=False)
-        wrote_header = True
+            if not chunk.empty:
+                last_time = int(chunk["time"].iloc[-1])
 
-        total_rows += len(chunk)
-        total_labels += int(chunk["label"].sum())
-        print(
-            f"[parser] chunk {chunk_index:,}: rows={len(chunk):,}, "
-            f"labels={int(chunk['label'].sum()):,}, total={total_rows:,}"
-        )
+            chunk = _to_team_format(chunk)
+            chunk.to_csv(
+                output_path,
+                mode="w" if not wrote_header else "a",
+                header=not wrote_header,
+                index=False,
+            )
+            wrote_header = True
+
+            total_rows += len(chunk)
+            total_labels += int(chunk["label"].sum())
+            print(
+                f"[parser] chunk {chunk_index:,}: rows={len(chunk):,}, "
+                f"labels={int(chunk['label'].sum()):,}, total={total_rows:,}"
+            )
+    finally:
+        close_reader = getattr(reader, "close", None)
+        if close_reader is not None:
+            close_reader()
 
     print(f"[parser] Saved {total_rows:,} rows -> {_display_path(output_path)}")
     print(f"[parser] Matched redteam labels: {total_labels:,}")
