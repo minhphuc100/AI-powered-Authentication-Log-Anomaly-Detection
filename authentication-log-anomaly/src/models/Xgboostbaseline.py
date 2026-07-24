@@ -8,8 +8,16 @@ import pandas as pd
 from xgboost import XGBClassifier
 
 try:
+    from ..data_engineering.feature_builder import (
+        FEATURE_COLUMNS,
+        FEATURE_SCHEMA_VERSION,
+    )
     from .Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
 except ImportError:
+    from data_engineering.feature_builder import (
+        FEATURE_COLUMNS,
+        FEATURE_SCHEMA_VERSION,
+    )
     from Xgboostevaluate import calculate_security_metrics, print_metrics, save_metrics
 
 
@@ -22,18 +30,6 @@ TEST_PATH = SPLIT_DIR / "test.csv"
 MODEL_PATH = PROJECT_ROOT / "models" / "xgboost_baseline.pkl"
 METRICS_PATH = PROJECT_ROOT / "results" / "metrics" / "xgboost_baseline_metrics.csv"
 
-# The current three-day split cannot learn day_of_week or is_business_hours:
-# both are constant in train. timestamp and is_synthetic are audit columns only.
-FEATURE_COLUMNS = [
-    "failed_logins_5m_user",
-    "unique_src_ip_1h",
-    "failed_logins_5m_ip",
-    "failure_rate_1h",
-    "unique_users_1h_per_ip",
-    "hour_of_day",
-    "is_network_logon",
-]
-
 FEATURE_DTYPES = {column: "float32" for column in FEATURE_COLUMNS}
 READ_DTYPES = {**FEATURE_DTYPES, "label": "int8"}
 
@@ -44,7 +40,10 @@ def load_features(path: Path) -> pd.DataFrame:
     header = pd.read_csv(path, nrows=0).columns.tolist()
     missing = [column for column in FEATURE_COLUMNS + ["label"] if column not in header]
     if missing:
-        raise ValueError(f"Missing required columns in {path}: {missing}")
+        raise ValueError(
+            f"{path} does not match {FEATURE_SCHEMA_VERSION}; "
+            f"missing columns: {missing}"
+        )
     return pd.read_csv(
         path,
         usecols=FEATURE_COLUMNS + ["label"],
@@ -56,8 +55,24 @@ def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     missing = [column for column in FEATURE_COLUMNS + ["label"] if column not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-    X = df[FEATURE_COLUMNS].fillna(0.0).astype("float32", copy=False)
-    y = df["label"].fillna(0).astype("int8", copy=False)
+    unexpected = [
+        column
+        for column in df.columns
+        if column not in FEATURE_COLUMNS + ["label"]
+    ]
+    if unexpected:
+        raise ValueError(f"Unexpected model columns: {unexpected}")
+
+    # load_features() already reads only FEATURE_COLUMNS + label. Popping the
+    # target avoids creating another multi-gigabyte copy of the feature matrix.
+    y = df.pop("label").fillna(0).astype("int8", copy=False)
+    if df.columns.tolist() != FEATURE_COLUMNS:
+        raise ValueError("Feature columns are not in the canonical model order.")
+    X = df
+    if X.isna().any().any():
+        invalid = X.columns[X.isna().any()].tolist()
+        raise ValueError(f"Feature columns contain NaN: {invalid}")
+    X = X.astype("float32", copy=False)
     return X, y
 
 
