@@ -1,371 +1,330 @@
-"""Terminal demo for the AIC211 Windows authentication anomaly model.
-
-The model was trained on LANL authentication logs. Windows Event Log support is
-therefore an integration demo, not a production-quality Windows detector.
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
-import logging
+from datetime import datetime, timezone
 import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Iterable
-
 import joblib
 import pandas as pd
-import streamlit  # noqa: F401
-import xgboost as xgb
+import win32event
+import win32evtlog
 
-# Importing app_simple registers Streamlit cache decorators. Silence the harmless
-# "No runtime found" message because this program intentionally has no web UI.
-logging.getLogger("streamlit.runtime.caching.cache_data_api").setLevel(logging.ERROR)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-from src.deployment.app_simple import (  # noqa: E402
-    FEATURE_COLUMNS,
-    LoadedModel,
-    OnlineFeatureEngine,
-    _validate_feature_schema,
-    predict_probabilities,
-    read_windows_events,
-)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
+try:
+    from src.data_engineering.feature_builder import (
+        FIVE_MINUTES,
+        ONE_HOUR,
+        WindowCounter,
+        WindowDistinctCounter,
+        _first_seen_flag,
+        _hour_of_day,
+        _is_network_logon,
+        _is_success,
+        _seconds_since,
+        _valid_key,
+    )
+except ImportError as e:
+    print(f"[ERROR] Không import được feature_builder: {e}")
+    sys.exit(1)
 
-FEATURE_NAMES_VI = {
-    "auth_attempts_5m_per_src_user": "số lần xác thực của user trong 5 phút",
-    "successful_auths_5m_per_src_user": "số lần đăng nhập thành công trong 5 phút",
-    "unique_src_computers_1h_per_src_user": "số máy nguồn khác nhau của user trong 1 giờ",
-    "unique_dst_computers_5m_per_src_user": "số máy đích khác nhau của user trong 5 phút",
-    "unique_dst_computers_1h_per_src_user": "số máy đích khác nhau của user trong 1 giờ",
-    "unique_dst_users_1h_per_src_computer": "số user đích từ máy nguồn trong 1 giờ",
-    "unique_src_users_1h_per_dst_computer": "số user nguồn tới máy đích trong 1 giờ",
-    "prior_auth_count_1h_src_user_dst_computer": "số lần user đã truy cập máy đích trong 1 giờ",
-    "is_first_seen_src_user_src_computer": "lần đầu thấy cặp user–máy nguồn",
-    "is_first_seen_src_user_dst_computer": "lần đầu thấy cặp user–máy đích",
-    "is_first_seen_src_computer_dst_computer": "lần đầu thấy cặp máy nguồn–máy đích",
-    "seconds_since_last_auth_by_src_user": "thời gian từ lần xác thực trước của user",
-    "seconds_since_last_src_user_dst_computer": "thời gian từ lần truy cập trước tới máy đích",
-    "current_event_is_success": "sự kiện hiện tại đăng nhập thành công",
-    "hour_of_day": "giờ trong ngày",
-    "is_network_logon": "đăng nhập qua mạng",
-}
+MODEL_PATH = PROJECT_ROOT / "models" / "xgboost_weighted.pkl"
+NS = {"evt": "http://schemas.microsoft.com/win/2004/08/events/event"}
 
 
-def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+def parse_iso_timestamp(sys_time_str: str) -> int:
+    """Parse SystemTime ISO từ TimeCreated sang Unix Timestamp."""
+    if not sys_time_str or sys_time_str == "-":
+        return int(time.time())
+    try:
+        clean_str = sys_time_str.split(".")[0] + "Z"
+        dt = datetime.strptime(clean_str, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        return int(dt.timestamp())
+    except Exception:
+        return int(time.time())
 
 
-def load_cli_model(model_path: Path) -> LoadedModel:
-    loaded = joblib.load(model_path)
-    if not isinstance(loaded, dict) or "model" not in loaded:
-        raise ValueError(
-            "CLI yêu cầu model bundle mới gồm model, feature_columns và threshold."
+def parse_xml_event(xml_str: str):
+    """Parse XML và lấy thời gian từ TimeCreated."""
+    try:
+        root = ET.fromstring(xml_str)
+        system = root.find("evt:System", NS)
+
+        event_id_elem = (
+            system.find("evt:EventID", NS) if system is not None else None
+        )
+        event_id = (
+            int(event_id_elem.text) if event_id_elem is not None else None
         )
 
-    feature_columns = list(loaded.get("feature_columns", []))
-    _validate_feature_schema(feature_columns, "Model")
-    threshold = float(loaded.get("threshold", 0.5))
-    if not 0.0 <= threshold <= 1.0:
-        raise ValueError(f"Threshold trong model không hợp lệ: {threshold}")
+        if event_id not in (4624, 4625):
+            return None
 
-    model = loaded["model"]
-    if not hasattr(model, "predict_proba"):
-        raise TypeError("Model phải hỗ trợ predict_proba().")
-
-    return LoadedModel(
-        model=model,
-        feature_columns=feature_columns,
-        threshold=threshold,
-        train_source=str(loaded.get("train_source", "unknown")),
-    )
-
-
-def model_contributions(
-    bundle: LoadedModel,
-    feature_frame: pd.DataFrame,
-) -> dict[str, float]:
-    """Return per-event XGBoost contributions in log-odds space."""
-    try:
-        booster = bundle.model.get_booster()
-        matrix = xgb.DMatrix(
-            feature_frame[bundle.feature_columns],
-            feature_names=bundle.feature_columns,
+        record_id_elem = (
+            system.find("evt:EventRecordID", NS) if system is not None else None
         )
-        values = booster.predict(matrix, pred_contribs=True)[0]
-    except (AttributeError, TypeError, ValueError, xgb.core.XGBoostError):
-        return {}
-    return {
-        feature: float(value)
-        for feature, value in zip(bundle.feature_columns, values[:-1])
-    }
-
-
-def top_reasons(
-    features: dict[str, int],
-    contributions: dict[str, float],
-    limit: int = 3,
-) -> list[str]:
-    if contributions:
-        ranked = sorted(
-            contributions.items(),
-            key=lambda item: abs(item[1]),
-            reverse=True,
-        )[:limit]
-        return [
-            (
-                f"{'tăng' if value >= 0 else 'giảm'} điểm: "
-                f"{FEATURE_NAMES_VI.get(name, name)}={features[name]} "
-                f"(đóng góp {value:+.3f})"
-            )
-            for name, value in ranked
-        ]
-
-    fallback: list[str] = []
-    for name in (
-        "is_first_seen_src_user_dst_computer",
-        "is_first_seen_src_computer_dst_computer",
-        "is_first_seen_src_user_src_computer",
-        "is_network_logon",
-    ):
-        if features.get(name) == 1:
-            fallback.append(FEATURE_NAMES_VI[name])
-    if not fallback:
-        fallback.append("model kết hợp đồng thời toàn bộ 16 feature")
-    return fallback[:limit]
-
-
-def score_event(
-    engine: OnlineFeatureEngine,
-    bundle: LoadedModel,
-    event: dict[str, object],
-    threshold: float,
-) -> dict[str, object]:
-    features = engine.extract(event)
-    frame = pd.DataFrame([features], columns=FEATURE_COLUMNS)
-    score = float(predict_probabilities(bundle, frame)[0])
-    contributions = model_contributions(bundle, frame)
-    return {
-        **event,
-        **features,
-        "score": score,
-        "prediction": int(score >= threshold),
-        "reasons": top_reasons(features, contributions),
-    }
-
-
-def format_analysis(result: dict[str, object], threshold: float) -> str:
-    status = "CẢNH BÁO ANOMALY" if result["prediction"] else "Bình thường"
-    lines = [
-        "",
-        "=" * 78,
-        f"[{status}] {result['time_str']} | Event ID {result['event_id']}",
-        f"Score: {float(result['score']):.6f} | Threshold: {threshold:.6f}",
-        (
-            f"User: {result['src_username']} -> {result['username']} | "
-            f"Kết quả: {result['result']}"
-        ),
-        (
-            f"Máy: {result['src_host']} -> {result['destination_host']} | "
-            f"Logon type: {result['logon_type']}"
-        ),
-        "Phân tích các yếu tố có ảnh hưởng lớn nhất:",
-    ]
-    lines.extend(f"  - {reason}" for reason in result["reasons"])
-    return "\n".join(lines)
-
-
-def append_jsonl(path: Path, results: Iterable[dict[str, object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as stream:
-        for result in results:
-            serializable = {
-                key: value
-                for key, value in result.items()
-                if key != "reasons" or isinstance(value, list)
-            }
-            stream.write(json.dumps(serializable, ensure_ascii=False) + "\n")
-
-
-def read_events_or_explain(max_events: int) -> list[dict[str, object]]:
-    try:
-        return read_windows_events(max_events)
-    except Exception as exc:
-        if "Access is denied" in str(exc) or "access is denied" in str(exc).lower():
-            raise PermissionError(
-                "Windows từ chối đọc Security Event Log. "
-                "Hãy mở PowerShell/Terminal bằng 'Run as administrator' rồi chạy lại."
-            ) from exc
-        raise RuntimeError(f"Không đọc được Windows Security Event Log: {exc}") from exc
-
-
-def process_unseen(
-    events: list[dict[str, object]],
-    seen: set[str],
-    engine: OnlineFeatureEngine,
-    bundle: LoadedModel,
-    threshold: float,
-) -> list[dict[str, object]]:
-    results: list[dict[str, object]] = []
-    for event in events:
-        record_id = str(event["record_id"])
-        if record_id in seen:
-            continue
-        if engine.last_time is not None and int(event["timestamp"]) < engine.last_time:
-            continue
-        result = score_event(engine, bundle, event, threshold)
-        seen.add(record_id)
-        results.append(result)
-    return results
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Nạp XGBoost và phân tích sự kiện đăng nhập Windows ngay trong terminal."
+        record_id = (
+            int(record_id_elem.text) if record_id_elem is not None else None
         )
-    )
-    parser.add_argument(
-        "--model",
-        type=Path,
-        default=project_root() / "models" / "xgboost_smote.pkl",
-        help="Đường dẫn model bundle.",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=2_000,
-        help="Số sự kiện gần nhất dùng để tạo trạng thái lịch sử (mặc định: 2000).",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=None,
-        help="Ghi đè threshold lưu trong model.",
-    )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Phân tích log hiện có một lần rồi thoát.",
-    )
-    parser.add_argument(
-        "--show",
-        type=int,
-        default=10,
-        help="Với --once, hiển thị N sự kiện mới nhất (mặc định: 10).",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=200,
-        help="Số Event gần nhất đọc lại ở mỗi vòng theo dõi.",
-    )
-    parser.add_argument(
-        "--poll-seconds",
-        type=float,
-        default=3.0,
-        help="Khoảng nghỉ giữa hai lần đọc Event Log.",
-    )
-    parser.add_argument(
-        "--alerts-only",
-        action="store_true",
-        help="Trong chế độ liên tục, chỉ in sự kiện bị cảnh báo.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Tùy chọn lưu kết quả dưới dạng JSON Lines.",
-    )
-    return parser
+
+        time_created_node = (
+            system.find("evt:TimeCreated", NS) if system is not None else None
+        )
+        sys_time_str = (
+            time_created_node.attrib.get("SystemTime", "-")
+            if time_created_node is not None
+            else "-"
+        )
+        timestamp = parse_iso_timestamp(sys_time_str)
+
+        computer_elem = (
+            system.find("evt:Computer", NS) if system is not None else None
+        )
+        dst_computer = computer_elem.text if computer_elem is not None else "-"
+
+        event_data = {}
+        data_nodes = root.findall(".//evt:EventData/evt:Data", NS)
+        for node in data_nodes:
+            name = node.attrib.get("Name")
+            if name:
+                event_data[name] = node.text or "-"
+
+        src_username = event_data.get("SubjectUserName", "-")
+        dst_username = event_data.get("TargetUserName", "-")
+        logon_type = event_data.get("LogonType", "-")
+        src_computer = event_data.get("WorkstationName", "-")
+
+        if src_computer in ("-", "", None):
+            src_computer = event_data.get("IpAddress", "-")
+
+        return {
+            "record_id": record_id,
+            "timestamp": timestamp,
+            "event_id": event_id,
+            "src_username": src_username,
+            "username": dst_username,
+            "src_host": src_computer,
+            "destination_host": dst_computer,
+            "logon_type": logon_type,
+        }
+    except Exception:
+        return None
 
 
-def validate_args(args: argparse.Namespace) -> None:
-    if args.warmup < 1 or args.show < 1 or args.batch_size < 1:
-        raise ValueError("--warmup, --show và --batch-size phải lớn hơn 0.")
-    if args.poll_seconds <= 0:
-        raise ValueError("--poll-seconds phải lớn hơn 0.")
-    if args.threshold is not None and not 0.0 <= args.threshold <= 1.0:
-        raise ValueError("--threshold phải nằm trong đoạn [0, 1].")
+def live_stream_detection():
+    if not MODEL_PATH.exists():
+        print(f"[ERROR] Không tìm thấy model tại: {MODEL_PATH}")
+        return
 
+    print(f"[INFO] Loading model from: {MODEL_PATH}")
+    bundle = joblib.load(MODEL_PATH)
+    model = bundle["model"]
+    feature_cols = bundle["feature_columns"]
+    threshold = bundle["threshold"]
+    print(f"[SUCCESS] Model Loaded! Threshold = {threshold:.5f}\n")
 
-def run(args: argparse.Namespace) -> int:
-    validate_args(args)
-    model_path = args.model.expanduser().resolve()
-    if not model_path.exists():
-        raise FileNotFoundError(f"Không tìm thấy model: {model_path}")
+    # Windows State
+    attempts_5m = WindowCounter(FIVE_MINUTES)
+    successes_5m = WindowCounter(FIVE_MINUTES)
+    src_computers_1h = WindowDistinctCounter(ONE_HOUR)
+    dst_computers_5m = WindowDistinctCounter(FIVE_MINUTES)
+    dst_computers_1h = WindowDistinctCounter(ONE_HOUR)
+    dst_users_1h = WindowDistinctCounter(ONE_HOUR)
+    src_users_1h = WindowDistinctCounter(ONE_HOUR)
+    auth_count_1h = WindowCounter(ONE_HOUR)
 
-    print("AIC211 TERMINAL AUTHENTICATION ANOMALY DEMO")
-    print("-" * 78)
-    print(f"Đang tải model: {model_path}")
-    bundle = load_cli_model(model_path)
-    threshold = (
-        float(args.threshold)
-        if args.threshold is not None
-        else float(bundle.threshold)
-    )
-    print(
-        f"Đã tải model | features={len(bundle.feature_columns)} | "
-        f"train={bundle.train_source} | threshold={threshold:.6f}"
-    )
-    print(
-        "LƯU Ý: model học từ LANL; kết quả trên Windows laptop chỉ là demo "
-        "tích hợp và có thể có domain shift/báo động giả."
-    )
-    print(f"Đang đọc {args.warmup:,} Security Event gần nhất để warm-up...")
+    seen_src_user_src_computer = set()
+    seen_src_user_dst_computer = set()
+    seen_src_computer_dst_computer = set()
+    last_auth_by_src_user = {}
+    last_auth_by_src_user_dst_computer = {}
 
-    events = read_events_or_explain(args.warmup)
-    engine = OnlineFeatureEngine()
-    seen: set[str] = set()
-    warmup_results = process_unseen(events, seen, engine, bundle, threshold)
-    alert_count = sum(int(item["prediction"]) for item in warmup_results)
-    print(
-        f"Warm-up hoàn tất: {len(warmup_results):,} Event | "
-        f"cảnh báo theo threshold hiện tại: {alert_count:,}"
-    )
+    processed_record_ids = set()
 
-    if args.once:
-        selected = warmup_results[-args.show :]
-        for result in selected:
-            print(format_analysis(result, threshold))
-        if args.output:
-            append_jsonl(args.output, selected)
-            print(f"\nĐã lưu {len(selected)} kết quả vào: {args.output.resolve()}")
-        return 0
+    h_event = win32event.CreateEvent(None, 0, 0, None)
+    xpath_query = "*[System[(EventID=4624 or EventID=4625)]]"
 
-    print(
-        "\nĐang theo dõi sự kiện mới. Hãy thử đăng nhập/đăng xuất; "
-        "nhấn Ctrl+C để dừng."
-    )
     try:
-        while True:
-            events = read_events_or_explain(args.batch_size)
-            results = process_unseen(events, seen, engine, bundle, threshold)
-            displayed = [
-                item
-                for item in results
-                if not args.alerts_only or int(item["prediction"]) == 1
-            ]
-            for result in displayed:
-                print(format_analysis(result, threshold))
-            if args.output and results:
-                append_jsonl(args.output, results)
-            time.sleep(args.poll_seconds)
-    except KeyboardInterrupt:
-        print("\nĐã dừng theo dõi.")
-        return 0
+        subscription = win32evtlog.EvtSubscribe(
+            "Security",
+            win32evtlog.EvtSubscribeToFutureEvents,
+            SignalEvent=h_event,
+            Query=xpath_query,
+        )
+    except Exception as e:
+        print(f"[ERROR] EvtSubscribe thất bại: {e}")
+        return
 
+    print("[STATUS] LISTENING FOR LIVE REAL-TIME EVENTS...\n")
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-    try:
-        return run(args)
-    except (FileNotFoundError, PermissionError, RuntimeError, ValueError) as exc:
-        print(f"\nLỖI: {exc}", file=sys.stderr)
-        return 2
+    while True:
+        try:
+            win32event.WaitForSingleObject(h_event, 1000)
+            events = win32evtlog.EvtNext(subscription, 10, Timeout=100)
+
+            for handle in events:
+                xml_str = win32evtlog.EvtRender(
+                    handle, win32evtlog.EvtRenderEventXml
+                )
+                item = parse_xml_event(xml_str)
+
+                if not item:
+                    continue
+
+                record_id = item["record_id"]
+                if record_id in processed_record_ids:
+                    continue
+                if record_id is not None:
+                    processed_record_ids.add(record_id)
+                    if len(processed_record_ids) > 10000:
+                        processed_record_ids.pop()
+
+                event_id = item["event_id"]
+                current_time = item["timestamp"]
+                src_username = item["src_username"]
+                dst_username = item["username"]
+                src_computer = item["src_host"]
+                dst_computer = item["destination_host"]
+                logon_type = item["logon_type"]
+
+                time_formatted = datetime.fromtimestamp(current_time).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+
+                # Expire sliding windows
+                for w in (
+                    attempts_5m,
+                    successes_5m,
+                    src_computers_1h,
+                    dst_computers_5m,
+                    dst_computers_1h,
+                    dst_users_1h,
+                    src_users_1h,
+                    auth_count_1h,
+                ):
+                    w.expire(current_time)
+
+                current_event_is_success = _is_success(event_id)
+                src_user_src_computer = (src_username, src_computer)
+                src_user_dst_computer = (src_username, dst_computer)
+                src_computer_dst_computer = (src_computer, dst_computer)
+
+                valid_src_user = _valid_key(src_username)
+                valid_src_user_src_computer = _valid_key(
+                    src_username, src_computer
+                )
+                valid_src_user_dst_computer = _valid_key(
+                    src_username, dst_computer
+                )
+                valid_src_computer_dst_computer = _valid_key(
+                    src_computer, dst_computer
+                )
+
+                # Extract features
+                feature_dict = {
+                    "auth_attempts_5m_per_src_user": attempts_5m.get(
+                        src_username
+                    ),
+                    "successful_auths_5m_per_src_user": successes_5m.get(
+                        src_username
+                    ),
+                    "unique_src_computers_1h_per_src_user": src_computers_1h.nunique(
+                        src_username
+                    ),
+                    "unique_dst_computers_5m_per_src_user": dst_computers_5m.nunique(
+                        src_username
+                    ),
+                    "unique_dst_computers_1h_per_src_user": dst_computers_1h.nunique(
+                        src_username
+                    ),
+                    "unique_dst_users_1h_per_src_computer": dst_users_1h.nunique(
+                        src_computer
+                    ),
+                    "unique_src_users_1h_per_dst_computer": src_users_1h.nunique(
+                        dst_computer
+                    ),
+                    "prior_auth_count_1h_src_user_dst_computer": auth_count_1h.get(
+                        src_user_dst_computer
+                    ),
+                    "is_first_seen_src_user_src_computer": _first_seen_flag(
+                        seen_src_user_src_computer,
+                        src_user_src_computer,
+                        valid_src_user_src_computer,
+                    ),
+                    "is_first_seen_src_user_dst_computer": _first_seen_flag(
+                        seen_src_user_dst_computer,
+                        src_user_dst_computer,
+                        valid_src_user_dst_computer,
+                    ),
+                    "is_first_seen_src_computer_dst_computer": _first_seen_flag(
+                        seen_src_computer_dst_computer,
+                        src_computer_dst_computer,
+                        valid_src_computer_dst_computer,
+                    ),
+                    "seconds_since_last_auth_by_src_user": _seconds_since(
+                        last_auth_by_src_user,
+                        src_username,
+                        current_time,
+                        valid_src_user,
+                    ),
+                    "seconds_since_last_src_user_dst_computer": _seconds_since(
+                        last_auth_by_src_user_dst_computer,
+                        src_user_dst_computer,
+                        current_time,
+                        valid_src_user_dst_computer,
+                    ),
+                    "current_event_is_success": current_event_is_success,
+                    "hour_of_day": _hour_of_day(current_time),
+                    "is_network_logon": _is_network_logon(logon_type),
+                }
+
+                # Update State
+                attempts_5m.add(current_time, src_username)
+                if current_event_is_success:
+                    successes_5m.add(current_time, src_username)
+                src_computers_1h.add(current_time, src_username, src_computer)
+                dst_computers_5m.add(current_time, src_username, dst_computer)
+                dst_computers_1h.add(current_time, src_username, dst_computer)
+                dst_users_1h.add(current_time, src_computer, dst_username)
+                src_users_1h.add(current_time, dst_computer, src_username)
+                if valid_src_user_dst_computer:
+                    auth_count_1h.add(current_time, src_user_dst_computer)
+
+                if valid_src_user_src_computer:
+                    seen_src_user_src_computer.add(src_user_src_computer)
+                if valid_src_user_dst_computer:
+                    seen_src_user_dst_computer.add(src_user_dst_computer)
+                    last_auth_by_src_user_dst_computer[
+                        src_user_dst_computer
+                    ] = current_time
+                if valid_src_computer_dst_computer:
+                    seen_src_computer_dst_computer.add(
+                        src_computer_dst_computer
+                    )
+                if valid_src_user:
+                    last_auth_by_src_user[src_username] = current_time
+
+                # Inference
+                X_single = pd.DataFrame([feature_dict])[feature_cols].astype(
+                    "float32"
+                )
+                score = float(model.predict_proba(X_single)[0, 1])
+                label_str = "ANOMALY" if score >= threshold else "NORMAL"
+
+                src_str = f"{src_username}@{src_computer}"
+                dst_str = f"{dst_username}@{dst_computer}"
+
+                print(
+                    f"[{label_str:<7}] rec_id={record_id} | time={time_formatted} | id={event_id} | score={score:.5f} (threshold={threshold:.5f}) | {src_str} -> {dst_str}"
+                )
+
+        except Exception:
+            time.sleep(0.1)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    live_stream_detection()
