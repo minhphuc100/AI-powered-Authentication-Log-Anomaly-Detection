@@ -1,32 +1,29 @@
-project/
+```
+authentication-log-anomaly
 │
-├── data/
-│   ├── raw_auth_logs.csv          
-│   ├── features.csv               
-│   └── splits/
-│       ├── train.csv
-│       ├── val.csv
-│       └── test.csv
+├── data
+│   ├── raw
+│   └── processed
 │
-├── notebooks/
-│   ├── 01_EDA.ipynb
-│   ├── 02_feature_engineering.ipynb
-│   ├── 03_isolation_forest.ipynb
-│   └── 04_improved_xgboost.ipynb
+├── models
+│   ├── xgboost_weighted.pkl
+│   └── metrics
+│        ├── xgboost_baseline_metrics.csv
+│        ├── xgboost_smote_feature_importance.csv
+│        ├── xgboost_smote_metrics.csv
+│        ├── xgboost_weighted_feature_importance.csv
+│        └── xgboost_weight_metric.csv
 │
-├── models/
-│   ├── isolation_forest.pkl
-│   └── xgboost_model.pkl
+├── results
+│   ├── figures
+│   ├── confusion_matrix.png
+│   └── feature_importance.png
 │
-├── results/
-│   ├── class_distribution.png
-│   ├── confusion_matrix_if.png
-│   ├── confusion_matrix_xgb.png
-│   └── metrics_comparison.csv
+├── src
+│   ├── data_engineering
+│   ├── models
+│   └── deployment
 │
-├── app/
-│   └── streamlit_app.py
-│
-├── generate_data.py
 ├── requirements.txt
-└── README.md
+├── README.md
+└── About.txt
