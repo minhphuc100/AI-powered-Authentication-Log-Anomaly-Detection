@@ -99,7 +99,7 @@ def save_feature_importance(model: XGBClassifier, output_path: Path) -> pd.DataF
 
 
 def train_improved_model(
-    train_source: str = "original",
+    train_source: str = "smote",
     valid_path: Path = VALID_PATH,
     test_path: Path = TEST_PATH,
     model_path: Path | None = None,
@@ -125,11 +125,8 @@ def train_improved_model(
     if anomaly_count == 0:
         raise ValueError(f"No anomaly labels found in {train_path}")
     raw_scale_pos_weight = normal_count / anomaly_count
-    scale_pos_weight = (
-        float(np.sqrt(raw_scale_pos_weight))
-        if train_source == "original"
-        else 1.0
-    )
+    
+    scale_pos_weight = float(np.sqrt(raw_scale_pos_weight)) 
 
     model = XGBClassifier(
         n_estimators=500,
@@ -165,7 +162,9 @@ def train_improved_model(
     X_test, y_test = prepare_xy(test_df)
     test_probability = model.predict_proba(X_test)[:, 1]
     test_prediction = (test_probability >= threshold).astype("int8")
+
     model_name = f"xgboost_{'weighted' if train_source == 'original' else 'smote'}"
+
     metrics = calculate_security_metrics(
         y_test,
         test_prediction,
@@ -223,7 +222,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-source",
         choices=("original", "smote"),
-        default="original",
+        default="smote",
     )
     parser.add_argument("--valid", type=Path, default=VALID_PATH)
     parser.add_argument("--test", type=Path, default=TEST_PATH)
