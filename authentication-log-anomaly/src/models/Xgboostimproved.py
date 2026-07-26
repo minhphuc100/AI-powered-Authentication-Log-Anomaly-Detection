@@ -126,7 +126,7 @@ def train_improved_model(
         raise ValueError(f"No anomaly labels found in {train_path}")
     raw_scale_pos_weight = normal_count / anomaly_count
     
-    scale_pos_weight = float(np.sqrt(raw_scale_pos_weight)) 
+    scale_pos_weight = float(np.sqrt(raw_scale_pos_weight)) # Use square root of the ratio to reduce the weight for anomalies
 
     model = XGBClassifier(
         n_estimators=500,
