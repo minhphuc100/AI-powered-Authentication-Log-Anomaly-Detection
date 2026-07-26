@@ -1,0 +1,17 @@
+feature,importance
+unique_src_users_1h_per_dst_computer,0.14475153
+seconds_since_last_src_user_dst_computer,0.119743586
+unique_dst_computers_1h_per_src_user,0.09378013
+unique_dst_computers_5m_per_src_user,0.093513146
+prior_auth_count_1h_src_user_dst_computer,0.07848975
+unique_dst_users_1h_per_src_computer,0.075317636
+is_network_logon,0.074404724
+is_first_seen_src_user_dst_computer,0.07194276
+is_first_seen_src_computer_dst_computer,0.046967868
+seconds_since_last_auth_by_src_user,0.04511651
+unique_src_computers_1h_per_src_user,0.04152419
+current_event_is_success,0.04047461
+hour_of_day,0.02799632
+is_first_seen_src_user_src_computer,0.026992634
+successful_auths_5m_per_src_user,0.009709213
+auth_attempts_5m_per_src_user,0.009275398

@@ -46,7 +46,7 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = PROJECT_ROOT / "models"
-METRICS_DIR = PROJECT_ROOT / "results" / "metrics"
+METRICS_DIR = PROJECT_ROOT / "models" / "metrics"
 
 
 def _fit_with_early_stopping(
@@ -99,7 +99,7 @@ def save_feature_importance(model: XGBClassifier, output_path: Path) -> pd.DataF
 
 
 def train_improved_model(
-    train_source: str = "smote",
+    train_source: str = "original",
     valid_path: Path = VALID_PATH,
     test_path: Path = TEST_PATH,
     model_path: Path | None = None,
@@ -222,7 +222,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-source",
         choices=("original", "smote"),
-        default="smote",
+        default="original",
     )
     parser.add_argument("--valid", type=Path, default=VALID_PATH)
     parser.add_argument("--test", type=Path, default=TEST_PATH)

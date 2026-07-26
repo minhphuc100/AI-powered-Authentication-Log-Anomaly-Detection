@@ -39,7 +39,7 @@ SMOTE_TRAIN_PATH = SPLIT_DIR / "train_smote.csv"
 VALID_PATH = SPLIT_DIR / "valid.csv"
 TEST_PATH = SPLIT_DIR / "test.csv"
 MODEL_PATH = PROJECT_ROOT / "models" / "xgboost_baseline.pkl"
-METRICS_PATH = PROJECT_ROOT / "results" / "metrics" / "xgboost_baseline_metrics.csv"
+METRICS_PATH = PROJECT_ROOT / "models" / "metrics" / "xgboost_baseline_metrics.csv"
 
 FEATURE_DTYPES = {column: "float32" for column in FEATURE_COLUMNS}
 READ_DTYPES = {**FEATURE_DTYPES, "label": "int8"}

@@ -1,0 +1,2 @@
+model,accuracy,precision,recall,f1,true_negative,false_positive,false_negative,true_positive,roc_auc,pr_auc,threshold,train_source
+xgboost_baseline_unweighted,0.9999986570747318,0.0,0.0,0.0,20105336,2,25,0,0.9801509768201858,0.0033893521469299257,0.5,train.csv
